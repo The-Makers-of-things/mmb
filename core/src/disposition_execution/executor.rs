@@ -1,34 +1,24 @@
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
-use futures::FutureExt;
 use itertools::Itertools;
-use mmb_utils::infrastructure::WithExpect;
+use mmb_utils::infrastructure::{SpawnFutureFlags, WithExpect};
 use mmb_utils::{nothing_to_do, DateTime};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::sync::{broadcast, oneshot};
 
+use crate::disposition_execution::strategy::DispositionStrategy;
 use crate::disposition_execution::trading_context_calculation::calculate_trading_context;
-use crate::exchanges::common::{Amount, CurrencyPair, ExchangeAccountId, Price, TradePlaceAccount};
-use crate::exchanges::events::ExchangeEvent;
 use crate::exchanges::general::exchange::Exchange;
 use crate::exchanges::general::request_type::RequestType;
-use crate::exchanges::general::symbol::Symbol;
 use crate::explanation::{Explanation, WithExplanation};
 use crate::lifecycle::trading_engine::{EngineContext, Service};
 use crate::misc::reserve_parameters::ReserveParameters;
 use crate::order_book::local_snapshot_service::LocalSnapshotsService;
-use crate::orders::event::OrderEventType;
-use crate::orders::order::{
-    ClientOrderId, OrderCreating, OrderExecutionType, OrderHeader, OrderSide, OrderSnapshot,
-    OrderStatus, OrderType,
-};
-use crate::orders::pool::OrderRef;
-use crate::strategies::disposition_strategy::DispositionStrategy;
 use crate::{
     disposition_execution::trade_limit::is_enough_amount_and_cost, infrastructure::spawn_future,
 };
@@ -39,6 +29,16 @@ use crate::{
     statistic_service::StatisticService,
 };
 use chrono::Duration;
+use mmb_domain::events::ExchangeEvent;
+use mmb_domain::exchanges::symbol::Symbol;
+use mmb_domain::market::CurrencyPair;
+use mmb_domain::market::{ExchangeAccountId, MarketAccountId};
+use mmb_domain::order::event::OrderEventType;
+use mmb_domain::order::pool::OrderRef;
+use mmb_domain::order::snapshot::{Amount, Price, UserOrder};
+use mmb_domain::order::snapshot::{
+    ClientOrderId, OrderHeader, OrderSide, OrderSnapshot, OrderStatus,
+};
 use mmb_utils::cancellation_token::CancellationToken;
 
 static DISPOSITION_EXECUTOR: &str = "DispositionExecutor";
@@ -62,13 +62,13 @@ pub struct DispositionExecutorService {
 }
 
 impl DispositionExecutorService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine_ctx: Arc<EngineContext>,
         events_receiver: broadcast::Receiver<ExchangeEvent>,
         local_snapshots_service: LocalSnapshotsService,
         exchange_account_id: ExchangeAccountId,
         currency_pair: CurrencyPair,
-        max_amount: Amount,
         strategy: Box<dyn DispositionStrategy>,
         cancellation_token: CancellationToken,
         statistics: Arc<StatisticService>,
@@ -82,7 +82,6 @@ impl DispositionExecutorService {
                 local_snapshots_service,
                 exchange_account_id,
                 currency_pair,
-                max_amount,
                 strategy,
                 work_finished_sender,
                 cancellation_token,
@@ -91,7 +90,11 @@ impl DispositionExecutorService {
 
             disposition_executor.start().await
         };
-        spawn_future("Start disposition executor", true, action.boxed());
+        spawn_future(
+            "Start disposition executor",
+            SpawnFutureFlags::STOP_BY_TOKEN | SpawnFutureFlags::DENY_CANCELLATION,
+            action,
+        );
 
         Arc::new(DispositionExecutorService {
             work_finished_receiver: Mutex::new(Some(receiver)),
@@ -118,7 +121,6 @@ struct DispositionExecutor {
     engine_ctx: Arc<EngineContext>,
     exchange_account_id: ExchangeAccountId,
     symbol: Arc<Symbol>,
-    max_amount: Amount,
     events_receiver: broadcast::Receiver<ExchangeEvent>,
     local_snapshots_service: LocalSnapshotsService,
     orders_state: OrdersState,
@@ -129,13 +131,13 @@ struct DispositionExecutor {
 }
 
 impl DispositionExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine_ctx: Arc<EngineContext>,
         events_receiver: broadcast::Receiver<ExchangeEvent>,
         local_snapshots_service: LocalSnapshotsService,
         exchange_account_id: ExchangeAccountId,
         currency_pair: CurrencyPair,
-        max_amount: Amount,
         strategy: Box<dyn DispositionStrategy>,
         work_finished_sender: oneshot::Sender<Result<()>>,
         cancellation_token: CancellationToken,
@@ -154,7 +156,6 @@ impl DispositionExecutor {
             local_snapshots_service,
             exchange_account_id,
             symbol,
-            max_amount,
             orders_state: OrdersState::new(),
             strategy,
             work_finished_sender: Some(work_finished_sender),
@@ -168,59 +169,49 @@ impl DispositionExecutor {
 
         loop {
             let event = tokio::select! {
-                event_res = self.events_receiver.recv() => event_res.context("Error during receiving event in DispositionExecutor::start()")?,
+                event_res = self.events_receiver.recv() => event_res.map_err(|e| anyhow!("Error during receiving event in DispositionExecutor::start(). Error: {e}."))?,
                 _ = self.cancellation_token.when_cancelled() => {
-                    let _ = self.work_finished_sender.take().ok_or(anyhow!("Can't take `work_finished_sender` in DispositionExecutor"))?.send(Ok(()));
+                    let _ = self.work_finished_sender.take().ok_or_else(|| anyhow!("Can't take `work_finished_sender` in DispositionExecutor"))?.send(Ok(()));
                     return Ok(());
                 }
             };
 
-            self.handle_event(event, &mut trading_context)?;
+            self.handle_event(&event, &mut trading_context)?;
         }
     }
 
     fn handle_event(
         &mut self,
-        event: ExchangeEvent,
+        event: &ExchangeEvent,
         last_trading_context: &mut Option<TradingContext>,
     ) -> Result<()> {
         let now = now();
-        let need_recalculate_trading_context = self.prepare_estimate_trading_context(&event, now);
+        let need_recalculate_trading_context = self.prepare_estimate_trading_context(event, now);
 
         match event {
             ExchangeEvent::OrderBookEvent(order_book_event) => {
                 let _ = self.local_snapshots_service.update(order_book_event);
             }
             ExchangeEvent::OrderEvent(order_event) => {
-                if order_event.order.is_external_order() {
+                let order = &order_event.order;
+                if order.order_type().is_external_order() {
                     return Ok(());
                 }
 
-                let order = &order_event.order;
                 match order_event.event_type {
                     OrderEventType::CreateOrderSucceeded => nothing_to_do(),
                     OrderEventType::CreateOrderFailed => {
                         let client_order_id = order.client_order_id();
-                        log::trace!(
-                            "Started handling event CreateOrderFailed {} in DispositionExecutor",
-                            client_order_id
-                        );
-                        let price_slot = self.get_price_slot(order);
-                        let price_slot = match price_slot {
-                            None => return Ok(()),
-                            Some(v) => v,
-                        };
+                        log::trace!("Started handling event CreateOrderFailed {client_order_id} in DispositionExecutor");
+                        let Some(price_slot) = self.get_price_slot(order) else { return Ok(()); };
 
                         self.finish_order(order, price_slot)?;
-                        log::trace!(
-                            "Finished handling event CreateOrderFailed {} in DispositionExecutor",
-                            client_order_id
-                        );
+                        log::trace!("Finished handling event CreateOrderFailed {client_order_id} in DispositionExecutor");
                     }
                     OrderEventType::OrderFilled { ref cloned_order } => {
                         log::trace!(
                             "Started handling event OrderFilled {} in DispositionExecutor",
-                            cloned_order.header.client_order_id
+                            cloned_order.client_order_id()
                         );
                         let price_slot = self.get_price_slot(order);
                         if let Some(price_slot) = price_slot {
@@ -257,10 +248,7 @@ impl DispositionExecutor {
                     }
                     OrderEventType::CancelOrderSucceeded => {
                         let client_order_id = order.client_order_id();
-                        log::trace!(
-                            "Started handling event CancelOrderSucceeded {} in DispositionExecutor",
-                            client_order_id
-                        );
+                        log::trace!("Started handling event CancelOrderSucceeded {client_order_id} in DispositionExecutor");
 
                         let price_slot = self.get_price_slot(order);
                         let price_slot = match price_slot {
@@ -269,10 +257,7 @@ impl DispositionExecutor {
                         };
 
                         self.finish_order(order, price_slot)?;
-                        log::trace!(
-                            "Finished handling event CancelOrderSucceeded {} in DispositionExecutor",
-                            client_order_id
-                        );
+                        log::trace!("Finished handling event CancelOrderSucceeded {client_order_id} in DispositionExecutor");
                     }
                     OrderEventType::CancelOrderFailed => {
                         //We should use WaitCancelOrder everywhere, so we don't need to
@@ -288,7 +273,7 @@ impl DispositionExecutor {
 
         let mut new_trading_context = estimate_trading_context(
             need_recalculate_trading_context,
-            self.max_amount,
+            event,
             self.strategy.as_mut(),
             &self.local_snapshots_service,
             now,
@@ -309,12 +294,13 @@ impl DispositionExecutor {
         trading_context: &mut Option<TradingContext>,
         now: DateTime,
     ) -> Result<()> {
+        let trading_context = match trading_context {
+            None => return Ok(()),
+            Some(v) => v,
+        };
+
         for (side, state_by_side) in self.orders_state.by_side.iter() {
-            let trading_context_by_side =
-                match trading_context.as_mut().map(|x| &mut x.by_side[side]) {
-                    None => continue,
-                    Some(v) => v,
-                };
+            let trading_context_by_side = &mut trading_context.by_side[side];
 
             self.synchronize_price_slots_for_list(
                 &state_by_side.slots,
@@ -324,7 +310,16 @@ impl DispositionExecutor {
             )?
         }
 
-        // TODO save explanations
+        let explanations = trading_context.get_explanations(
+            self.exchange_account_id.exchange_id,
+            self.symbol.currency_pair(),
+        );
+
+        self.engine_ctx
+            .event_recorder
+            .save(explanations)
+            .unwrap_or_else(|err| log::error!("unable save explanations: {err}"));
+
         Ok(())
     }
 
@@ -404,8 +399,7 @@ impl DispositionExecutor {
         let composite_order_ref = composite_order.borrow();
         if composite_order_ref.side != new_estimating_disposition.side() {
             panic!(
-                "Unmatched orders side. New disposition {:?}. Current composite order {:?}",
-                new_estimating_disposition, composite_order_ref
+                "Unmatched orders side. New disposition {new_estimating_disposition:?}. Current composite order {composite_order_ref:?}"
             );
         }
 
@@ -414,10 +408,10 @@ impl DispositionExecutor {
             composite_order_ref
                 .orders
                 .values()
-                .map(|or| or.order.fn_ref(|x| DisplaySmallOrder {
-                    price: x.price(),
-                    amount: x.amount()
-                }))
+                .map(|or| DisplaySmallOrder {
+                    price: or.order.price(),
+                    amount: or.order.amount(),
+                })
                 .join(", ")
         ));
 
@@ -434,10 +428,7 @@ impl DispositionExecutor {
                     desired_amount * (dec!(1) + ALLOWED_AMOUNT_DEVIATION_RATE);
 
                 if remaining_amount > desired_amount_with_allowed_deviation {
-                    explanation.add_reason(format!(
-                        "Existing amount ({}) > desired amount + allowed deviation ({})",
-                        remaining_amount, desired_amount_with_allowed_deviation
-                    ));
+                    explanation.add_reason(format!("Existing amount ({remaining_amount}) > desired amount + allowed deviation ({desired_amount_with_allowed_deviation})"));
 
                     drop(composite_order_ref);
                     let mut composite_order_mut = price_slot.order.borrow_mut();
@@ -455,7 +446,7 @@ impl DispositionExecutor {
 
                     return Ok(());
                 } else {
-                    explanation.add_reason(format!("Desired amount  ({}) <= existing amount ({}) <= desired amount + allowed deviation ({})", desired_amount, remaining_amount, desired_amount_with_allowed_deviation));
+                    explanation.add_reason(format!("Desired amount  ({desired_amount}) <= existing amount ({remaining_amount}) <= desired amount + allowed deviation ({desired_amount_with_allowed_deviation})"));
                 }
             }
 
@@ -514,7 +505,7 @@ impl DispositionExecutor {
         let orders_records = composite_order.orders.values_mut();
 
         self.start_cancelling_orders(
-            &format!("Cancelling all orders because {}", cause),
+            &format!("Cancelling all orders because {cause}"),
             orders_records,
             explanation,
         )
@@ -528,11 +519,11 @@ impl DispositionExecutor {
     ) {
         explanation.add_reason(explanation_msg);
 
-        log::trace!("start_cancelling_orders: begin ({})", explanation_msg);
+        log::trace!("start_cancelling_orders: begin ({explanation_msg})");
 
         order_records.for_each(|or| self.cancel_order(or, explanation));
 
-        log::trace!("start_cancelling_orders: Finish ({})", explanation_msg);
+        log::trace!("start_cancelling_orders: Finish ({explanation_msg})");
     }
 
     fn cancel_order(&self, order_record: &mut OrderRecord, explanation: &mut Explanation) {
@@ -546,32 +537,31 @@ impl DispositionExecutor {
         order_record.is_cancellation_requested = true;
 
         let order = order_record.order.clone();
+        let client_order_id = order.client_order_id();
         explanation.add_reason(format!(
-            "Cancelling order {} {}",
-            order.client_order_id(),
+            "Cancelling order {client_order_id} {}",
             order.exchange_account_id()
         ));
 
-        log::trace!("Begin cancel_order {}", order.client_order_id());
+        log::trace!("Begin cancel_order {client_order_id}");
 
-        let client_order_id = order.client_order_id();
-        let request_group_id = order_record.request_group_id.clone();
+        let request_group_id = order_record.request_group_id;
         let exchange = self.exchange();
         let cancellation_token = self.cancellation_token.clone();
 
         let action = async move {
-            log::trace!("Begin wait_cancel_order {}", client_order_id);
+            log::trace!("Begin wait_cancel_order {client_order_id}");
             exchange
                 .wait_cancel_order(order, Some(request_group_id), false, cancellation_token)
                 .await?;
-            log::trace!("Finished wait_cancel_order {}", client_order_id);
+            log::trace!("Finished wait_cancel_order {client_order_id}");
 
             Ok(())
         };
         spawn_future(
             "Start wait_cancel_order from DispositionExecutor::cancel_order()",
-            true,
-            action.boxed(),
+            SpawnFutureFlags::empty(),
+            action,
         );
     }
 
@@ -582,7 +572,7 @@ impl DispositionExecutor {
         explanation: &mut Explanation,
     ) {
         self.start_cancelling_orders(
-            &format!("Cancelling orders because {}", cause),
+            &format!("Cancelling orders because {cause}"),
             order_records,
             explanation,
         )
@@ -605,15 +595,12 @@ impl DispositionExecutor {
         let new_price = new_disposition.order.price;
         let found = self.find_new_order_crossing_existing_orders(new_price, side);
         if let Some(crossed_order) = found {
-            let msg = format!("Finished `try_create_order` because there is order {} with price {} that crossing current price {}", crossed_order.client_order_id(),
-                                 crossed_order.price(),
-                                 new_price
-            );
+            let msg = format!("Finished `try_create_order` because there is order {} with price {} that crossing current price {new_price}", crossed_order.client_order_id(), crossed_order.price());
             return log_trace(msg, explanation);
         }
 
         let new_order_amount = self.calculate_new_order_amount(
-            new_disposition.trade_place_account(),
+            new_disposition.market_account_id(),
             side,
             desired_amount,
             max_amount,
@@ -624,7 +611,7 @@ impl DispositionExecutor {
             is_enough_amount_and_cost(new_disposition, new_order_amount, true, &self.symbol)
         {
             return log_trace(
-                format!("Finished `try_create_order` by reason: {}", reason),
+                format!("Finished `try_create_order` by reason: {reason}"),
                 explanation,
             );
         }
@@ -635,7 +622,7 @@ impl DispositionExecutor {
             self.exchange_account_id,
             GROUP_REQUESTS_COUNT,
             DISPOSITION_EXECUTOR_REQUESTS_GROUP.to_string(),
-        )?;
+        );
 
         let requests_group_id = match requests_group_id {
             None => {
@@ -674,19 +661,9 @@ impl DispositionExecutor {
                 None => {
                     self.engine_ctx
                         .timeout_manager
-                        .remove_group(self.exchange_account_id, requests_group_id)
-                        .with_expect(|| {
-                            format!(
-                                "failed to remove_group for {} {}",
-                                self.exchange_account_id, requests_group_id,
-                            )
-                        });
+                        .remove_group(self.exchange_account_id, requests_group_id);
 
-                    return log_trace(
-                        format!(
-                            "Finished try_create_order because can't reserve balance {}",
-                            new_order_amount
-                        ),
+                    return log_trace(format!("Finished try_create_order because can't reserve balance {new_order_amount}"),
                         &mut explanation.expect(explanation_err_msg),
                     );
                 }
@@ -697,26 +674,21 @@ impl DispositionExecutor {
 
         if !self.engine_ctx.timeout_manager.try_reserve_group_instant(
             self.exchange_account_id,
-            RequestType::CancelOrder,
+            RequestType::CreateOrder,
             Some(requests_group_id),
-        )? {
+        ) {
             self.engine_ctx
                 .balance_manager
                 .lock()
                 .unreserve_rest(
                     reservation_id,
                 )
-                .with_expect(|| {
-                    format!(
-                        "DispositionExecutor::try_create_order() failed to unreserve_rest for: {:?}",
-                        reservation_id
-                    )
-                });
+                .with_expect(|| format!("DispositionExecutor::try_create_order() failed to unreserve_rest for: {reservation_id:?}"));
 
             let _ = self
                 .engine_ctx
                 .timeout_manager
-                .remove_group(self.exchange_account_id, requests_group_id)?;
+                .remove_group(self.exchange_account_id, requests_group_id);
 
             return log_trace(
                 "Finished `try_create_order` because can't reserve requests",
@@ -726,15 +698,13 @@ impl DispositionExecutor {
 
         *price_slot.estimating.borrow_mut() = Some(Box::new(new_estimating.clone()));
 
-        let new_order_header = OrderHeader::new(
+        let order_header = OrderHeader::with_user_order(
             new_client_order_id.clone(),
-            now,
             self.exchange_account_id,
             self.symbol.currency_pair(),
-            OrderType::Limit,
             new_disposition.side(),
             new_order_amount,
-            OrderExecutionType::MakerOnly,
+            UserOrder::maker_only(new_disposition.price()),
             Some(reservation_id),
             None,
             new_estimating.strategy_name.clone(),
@@ -742,9 +712,11 @@ impl DispositionExecutor {
 
         let exchange = self.exchange();
 
-        let new_order = exchange
-            .orders
-            .add_simple_initial(new_order_header.clone(), Some(new_disposition.price()));
+        let new_order = exchange.orders.add_simple_initial(
+            &order_header,
+            now,
+            exchange.exchange_client.get_initial_extension_data(),
+        );
 
         price_slot.add_order(
             new_disposition.side(),
@@ -753,7 +725,7 @@ impl DispositionExecutor {
             requests_group_id,
         );
 
-        explanation.add_reason(format!("Creating order {}", new_client_order_id));
+        explanation.add_reason(format!("Creating order {new_client_order_id}"));
 
         self.cancellation_token.error_if_cancellation_requested()?;
 
@@ -762,29 +734,26 @@ impl DispositionExecutor {
             let cancellation_token = self.cancellation_token.clone();
 
             let action = async move {
-                log::trace!("Begin create_order {}", new_client_order_id);
-
-                let order_creating = OrderCreating {
-                    header: new_order_header,
-                    price: new_price,
-                };
+                log::trace!("Begin create_order {new_client_order_id}");
 
                 exchange
-                    .create_order(&order_creating, None, cancellation_token)
+                    .create_order(&order_header, Some(requests_group_id), cancellation_token)
                     .await?;
 
-                log::trace!("Finished create_order {}", new_client_order_id);
+                log::trace!("Finished create_order {new_client_order_id}");
 
                 Ok(())
             };
+
             spawn_future(
-                "wait_cancel_order in blocking cancel_order",
-                true,
-                action.boxed(),
+                "create_order in blocking try_create_order",
+                SpawnFutureFlags::empty(),
+                action,
             );
         }
 
-        log::trace!("Begin try_create_order {}", new_client_order_id);
+        log::trace!("Begin try_create_order {new_client_order_id}");
+
         Ok(())
     }
 
@@ -802,7 +771,7 @@ impl DispositionExecutor {
         };
 
         for slot in &self.orders_state.by_side[side.change_side()].slots {
-            for (_, order_record) in &slot.order.borrow().orders {
+            for order_record in slot.order.borrow().orders.values() {
                 let order = &order_record.order;
                 if order.is_finished() && is_crossing(order) {
                     return Some(order.clone());
@@ -810,12 +779,12 @@ impl DispositionExecutor {
             }
         }
 
-        return None;
+        None
     }
 
     fn calculate_new_order_amount(
         &self,
-        _trade_place_account: TradePlaceAccount,
+        _market_account_id: MarketAccountId,
         side: OrderSide,
         desired_amount: Decimal,
         max_amount: Decimal,
@@ -827,75 +796,62 @@ impl DispositionExecutor {
         let balance_quota = max_amount - total_remaining_amount;
         let new_amount = desired_amount.min(balance_quota).max(dec!(0)) - high_priority_amount;
 
-        explanation.add_reason(format!(
-                "max_amount {} total_remaining_amount {} high_priority_amount {} balance_quota {} new_order_amount {}",
-                max_amount, total_remaining_amount, high_priority_amount, balance_quota, new_amount));
+        explanation.add_reason(format!("max_amount {max_amount} total_remaining_amount {total_remaining_amount} high_priority_amount {high_priority_amount} balance_quota {balance_quota} new_order_amount {new_amount}"));
 
         new_amount
     }
 
     fn get_price_slot(&self, order: &OrderRef) -> Option<&PriceSlot> {
-        let side = order.side();
-        let price_slot = self.orders_state.by_side[side].find_price_slot(order);
+        let header = order.header();
+        let price_slot = self.orders_state.by_side[header.side].find_price_slot(order);
         if price_slot.is_some() {
             return price_slot;
         }
 
         log::error!(
             "Can't find order with client_order_id {} {} in orders state of DispositionExecutor",
-            order.client_order_id(),
+            header.client_order_id,
             self.exchange_account_id
         );
-        return None;
+        None
     }
 
     fn finish_order(&self, order: &OrderRef, price_slot: &PriceSlot) -> Result<()> {
         let client_order_id = order.client_order_id();
-        log::trace!(
-            "Started DispositionExecutor::finish_order {}",
-            client_order_id
-        );
+        log::trace!("Started DispositionExecutor::finish_order {client_order_id}");
         self.unreserve_order_amount(order, price_slot);
-        self.remove_request_group(order, price_slot)?;
+        self.remove_request_group(order, price_slot);
 
         price_slot.remove_order(order);
 
-        log::trace!(
-            "Finished DispositionExecutor::finish_order {}",
-            client_order_id
-        );
+        log::trace!("Finished DispositionExecutor::finish_order {client_order_id}");
         Ok(())
     }
 
     fn unreserve_order_amount(&self, order: &OrderRef, _price_slot: &PriceSlot) {
-        let (reservation_id, client_order_id, amount) = order.fn_ref(|x| {
-            (
-                x.header.reservation_id,
-                x.header.client_order_id.clone(),
-                x.header.amount,
-            )
-        });
+        let client_order_id = order.client_order_id();
+        let reservation_id = order.header().reservation_id;
+
+        let reservation_id = reservation_id
+            .expect("DispositionExecutor::unreserve_order_amount(): ReservationId is None");
 
         self.engine_ctx
             .balance_manager
             .lock()
-            .unreserve_by_client_order_id(
-                reservation_id.expect("InternalEventsLoop: ReservationId is None"),
-                client_order_id,
-                amount,
-            )
-            .with_expect(|| format!("InternalEventsLoop: failed to unreserve order {:?}", order));
+            .unreserve_by_client_order_id(reservation_id, client_order_id.clone(), order.amount())
+            .with_expect(|| {
+                format!("DispositionExecutor::unreserve_order_amount(): failed to unreserve order {client_order_id:?}")
+            });
     }
 
-    fn remove_request_group(&self, order: &OrderRef, price_slot: &PriceSlot) -> Result<()> {
+    fn remove_request_group(&self, order: &OrderRef, price_slot: &PriceSlot) {
         let request_group_id =
             price_slot.order.borrow().orders[&order.client_order_id()].request_group_id;
 
         let _ = self
             .engine_ctx
             .timeout_manager
-            .remove_group(self.exchange_account_id, request_group_id)?;
-        Ok(())
+            .remove_group(self.exchange_account_id, request_group_id);
     }
 
     fn handle_order_fill(
@@ -948,7 +904,7 @@ impl DispositionExecutor {
 
 fn estimate_trading_context(
     need_recalculate_trading_context: bool,
-    max_amount: Amount,
+    event: &ExchangeEvent,
     strategy: &mut dyn DispositionStrategy,
     local_snapshots_service: &LocalSnapshotsService,
     now: DateTime,
@@ -958,7 +914,7 @@ fn estimate_trading_context(
     }
 
     Ok(calculate_trading_context(
-        max_amount,
+        event,
         strategy,
         local_snapshots_service,
         now,
@@ -984,12 +940,9 @@ fn get_cancelling_orders<'a>(
     for record in sorted_order_records {
         let order = &mut record.order;
 
-        let remaining_order_amount = order.fn_ref(|x| {
-            if order.is_finished() {
-                dec!(0)
-            } else {
-                x.amount() - x.filled_amount()
-            }
+        let remaining_order_amount = order.fn_ref(|x| match x.is_finished() {
+            true => dec!(0),
+            false => order.amount() - x.filled_amount(),
         });
 
         cancelling_orders.push(record);
@@ -1011,10 +964,9 @@ fn now() -> DateTime {
 }
 
 #[inline(always)]
-fn log_trace<'a>(msg: impl AsRef<str>, explanation: &mut Explanation) -> Result<()> {
+fn log_trace(msg: impl AsRef<str>, explanation: &mut Explanation) -> Result<()> {
     let msg = msg.as_ref();
-
-    log::trace!("{}", msg);
+    log::trace!("{msg}");
     explanation.add_reason(msg);
 
     Ok(())

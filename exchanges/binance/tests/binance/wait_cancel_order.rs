@@ -1,48 +1,23 @@
+use crate::binance::binance_builder::BinanceBuilder;
 use core_tests::order::OrderProxy;
-use mmb_core::exchanges::common::*;
-use mmb_core::exchanges::events::AllowedEventSourceType;
-use mmb_core::exchanges::general::commission::Commission;
-use mmb_core::exchanges::general::features::*;
-use mmb_core::settings::{CurrencyPairSetting, ExchangeSettings};
+use mmb_domain::events::AllowedEventSourceType;
 use mmb_utils::cancellation_token::CancellationToken;
 use mmb_utils::logger::init_logger;
+use rstest::rstest;
 
-use crate::binance::binance_builder::BinanceBuilder;
-use crate::get_binance_credentials_or_exit;
-
+#[rstest]
+#[case::all(AllowedEventSourceType::All)]
+#[case::fallback_only(AllowedEventSourceType::FallbackOnly)]
+#[case::non_fallback(AllowedEventSourceType::NonFallback)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancellation_waited_successfully() {
+async fn cancellation_waited_successfully(
+    #[case] allowed_cancel_event_source_type: AllowedEventSourceType,
+) {
     init_logger();
 
-    let exchange_account_id: ExchangeAccountId = "Binance_0".parse().expect("in test");
-    let (api_key, secret_key) = get_binance_credentials_or_exit!();
-    let mut settings = ExchangeSettings::new_short(exchange_account_id, api_key, secret_key, false);
-
-    // Currency pair in settings are matter here because of need to check
-    // Symbol in check_order_fills() inside wait_cancel_order()
-    settings.currency_pairs = Some(vec![CurrencyPairSetting {
-        base: "cnd".into(),
-        quote: "btc".into(),
-        currency_pair: None,
-    }]);
-
-    let binance_builder = match BinanceBuilder::try_new_with_settings(
-        settings.clone(),
-        exchange_account_id,
-        CancellationToken::default(),
-        ExchangeFeatures::new(
-            OpenOrdersType::AllCurrencyPair,
-            RestFillsFeatures::default(),
-            OrderFeatures::default(),
-            OrderTradeOption::default(),
-            WebSocketOptions::default(),
-            false,
-            true,
-            AllowedEventSourceType::default(),
-            AllowedEventSourceType::default(),
-        ),
-        Commission::default(),
-        true,
+    let binance_builder = match BinanceBuilder::build_account_0_with_source_types(
+        AllowedEventSourceType::All,
+        allowed_cancel_event_source_type,
     )
     .await
     {
@@ -51,11 +26,12 @@ async fn cancellation_waited_successfully() {
     };
 
     let order_proxy = OrderProxy::new(
-        exchange_account_id,
+        binance_builder.exchange.exchange_account_id,
         Some("FromCancellationWaitedSuccessfullyTest".to_owned()),
         CancellationToken::default(),
-        binance_builder.default_price,
+        binance_builder.min_price,
         binance_builder.min_amount,
+        binance_builder.default_currency_pair,
     );
 
     let order_ref = order_proxy
@@ -75,23 +51,9 @@ async fn cancellation_waited_successfully() {
 async fn cancellation_waited_failed_fallback() {
     init_logger();
 
-    let exchange_account_id: ExchangeAccountId = "Binance_0".parse().expect("in test");
-    let binance_builder = match BinanceBuilder::try_new(
-        exchange_account_id,
-        CancellationToken::default(),
-        ExchangeFeatures::new(
-            OpenOrdersType::AllCurrencyPair,
-            RestFillsFeatures::default(),
-            OrderFeatures::default(),
-            OrderTradeOption::default(),
-            WebSocketOptions::default(),
-            false,
-            true,
-            AllowedEventSourceType::default(),
-            AllowedEventSourceType::FallbackOnly,
-        ),
-        Commission::default(),
-        true,
+    let binance_builder = match BinanceBuilder::build_account_0_with_source_types(
+        AllowedEventSourceType::All,
+        AllowedEventSourceType::FallbackOnly,
     )
     .await
     {
@@ -100,11 +62,12 @@ async fn cancellation_waited_failed_fallback() {
     };
 
     let order_proxy = OrderProxy::new(
-        exchange_account_id,
+        binance_builder.exchange.exchange_account_id,
         Some("FromCancellationWaitedFailedFallbackTest".to_owned()),
         CancellationToken::default(),
-        binance_builder.default_price,
+        binance_builder.min_price,
         binance_builder.min_amount,
+        binance_builder.default_currency_pair,
     );
 
     let order_ref = order_proxy
@@ -116,8 +79,7 @@ async fn cancellation_waited_failed_fallback() {
         .exchange
         .wait_cancel_order(order_ref, None, true, CancellationToken::new())
         .await
-        .err()
-        .expect("Error was expected while trying wait_cancel_order()");
+        .expect_err("Error was expected while trying wait_cancel_order()");
 
     assert_eq!(
         "Order was expected to cancel explicitly via Rest or Web Socket but got timeout instead",

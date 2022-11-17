@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
-use crate::balance_manager::balance_request::BalanceRequest;
-use crate::exchanges::common::{Amount, CurrencyCode, CurrencyPair, ExchangeAccountId};
+use crate::balance::manager::balance_request::BalanceRequest;
 use crate::service_configuration::configuration_descriptor::{
     ConfigurationDescriptor, ServiceConfigurationKey, ServiceName,
 };
+use mmb_domain::market::{CurrencyCode, CurrencyPair, ExchangeAccountId};
+use serde::Serialize;
 
+use mmb_domain::order::snapshot::Amount;
 use mmb_utils::hashmap;
 use rust_decimal_macros::dec;
 
@@ -19,11 +21,11 @@ pub(crate) type CurrencyPairByCurrencyPair = HashMap<CurrencyPair, ValueByCurren
 pub(crate) type ValueByCurrencyCode = HashMap<CurrencyCode, Amount>;
 
 /// A tree that contain balance amounts distributed by
-/// ServiceNames -> ConfigurationKeys -> ExchangerAccountIds -> CurrencyPairs -> CurrencyCodes.
+/// ServiceNames -> ConfigurationKeys -> ExchangeAccountIds -> CurrencyPairs -> CurrencyCodes.
 ///     NOTE: there is storing all balances by ServiceNames(strategy name),
 ///     that will contain several configuration keys for strategies, next layer is one or more accounts for
 ///     selected ServiceName and here stored CurrencyCodes by CurrencyPairs and amount for every currency code.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct ServiceValueTree {
     tree: ConfigurationKeyByServiceName,
 }
@@ -103,9 +105,9 @@ impl ServiceValueTree {
         value: CurrencyPairByExchangeAccountId,
     ) {
         if let Some(sub_tree) = self.get_mut_by_service_name(service_name) {
-            sub_tree.insert(configuration_key.clone(), value);
+            sub_tree.insert(configuration_key, value);
         } else {
-            self.set_by_service_name(service_name, hashmap![configuration_key.clone() => value]);
+            self.set_by_service_name(service_name, hashmap![configuration_key => value]);
         }
     }
 
@@ -191,11 +193,6 @@ impl ServiceValueTree {
         );
     }
 
-    pub fn new() -> Self {
-        Self {
-            tree: HashMap::new(),
-        }
-    }
     pub fn get_as_balances(&self) -> HashMap<BalanceRequest, Amount> {
         self.tree
             .iter()
@@ -213,7 +210,7 @@ impl ServiceValueTree {
                                                         *service_name,
                                                         *service_configuration_key,
                                                     ),
-                                                    exchange_account_id.clone(),
+                                                    *exchange_account_id,
                                                     *currency_pair,
                                                     *currency_code,
                                                 ),
@@ -248,12 +245,12 @@ impl ServiceValueTree {
 mod test {
     use super::*;
 
-    use crate::exchanges::common::{CurrencyCode, CurrencyPair, ExchangeAccountId};
+    use mmb_domain::market::{CurrencyCode, CurrencyPair, ExchangeAccountId};
 
-    use mmb_utils::hashmap;
-    use mmb_utils::logger::init_logger;
+    use mmb_utils::{hashmap, logger::init_logger};
     use rust_decimal_macros::dec;
 
+    use mmb_domain::order::snapshot::Amount;
     use std::collections::HashMap;
 
     fn get_currency_codes() -> Vec<CurrencyCode> {
@@ -280,7 +277,7 @@ mod test {
             ("acc_3", 3),
             ("acc_4", 4),
         ]
-        .map(|x| ExchangeAccountId::new(x.0.into(), x.1))
+        .map(|x| ExchangeAccountId::new(x.0, x.1))
         .to_vec()
     }
     fn get_configuration_keys() -> Vec<ServiceConfigurationKey> {
@@ -296,7 +293,7 @@ mod test {
     }
 
     fn get_test_data() -> (ServiceValueTree, HashMap<BalanceRequest, Amount>) {
-        let mut service_value_tree = ServiceValueTree::new();
+        let mut service_value_tree = ServiceValueTree::default();
         let mut balances = HashMap::new();
         for service_name in get_service_names() {
             for service_configuration_key in get_configuration_keys() {
@@ -341,19 +338,19 @@ mod test {
     #[test]
     pub fn set() {
         init_logger();
-        let mut service_value_tree = ServiceValueTree::new();
+        let mut service_value_tree = ServiceValueTree::default();
 
         let service_name = "name".into();
         let service_configuration_key = "name".into();
-        let exchange_account_id = ExchangeAccountId::new("acc_0".into(), 0);
+        let exchange_account_id = ExchangeAccountId::new("acc_0", 0);
         let currency_pair = CurrencyPair::from_codes("b_0".into(), "q_0".into());
-        let currency_code = CurrencyCode::new("0".into());
+        let currency_code = CurrencyCode::new("0");
         let value = dec!(0);
 
         let new_service_configuration_key = "new_name".into();
-        let new_exchange_account_id = ExchangeAccountId::new("new_acc".into(), 0);
+        let new_exchange_account_id = ExchangeAccountId::new("new_acc", 0);
         let new_currency_pair = CurrencyPair::from_codes("new_code_b".into(), "new_code_q".into());
-        let new_currency_code = CurrencyCode::new("new_code".into());
+        let new_currency_code = CurrencyCode::new("new_code");
         let new_value = dec!(1);
 
         service_value_tree.set_by_service_name(
@@ -417,7 +414,7 @@ mod test {
             Some("trees remain identical after changing 'currency_code'"),
         );
 
-        let new_map = hashmap![new_currency_pair => new_map.clone()];
+        let new_map = hashmap![new_currency_pair => new_map];
         service_value_tree.set_by_exchange_account_id(
             service_name,
             service_configuration_key,
@@ -435,7 +432,7 @@ mod test {
             Some("trees remain identical after changing 'currency_pair'"),
         );
 
-        let new_map = hashmap![new_exchange_account_id => new_map.clone()];
+        let new_map = hashmap![new_exchange_account_id => new_map];
         service_value_tree.set_by_configuration_key(
             service_name,
             service_configuration_key,
@@ -452,8 +449,8 @@ mod test {
             Some("trees remain identical after changing 'exchange_account_id'"),
         );
 
-        let new_map = hashmap![new_service_configuration_key => new_map.clone()];
-        service_value_tree.set_by_service_name(service_name, new_map.clone());
+        let new_map = hashmap![new_service_configuration_key => new_map];
+        service_value_tree.set_by_service_name(service_name, new_map);
         assert_tree_item_eq_with_message(
             service_value_tree.get(),
             service_name,
@@ -473,15 +470,15 @@ mod test {
 
         let new_service_name = "new_service_name".into();
         let new_service_configuration_key = "new_service_configuration_key".into();
-        let new_exchange_account_id = ExchangeAccountId::new("new_exchange_account_id".into(), 0);
+        let new_exchange_account_id = ExchangeAccountId::new("new_exchange_account_id", 0);
         let new_currency_pair = CurrencyPair::from_codes(
             "new_currency_pair_b_0".into(),
             "new_currency_pair_q_0".into(),
         );
-        let new_currency_code = CurrencyCode::new("0".into());
+        let new_currency_code = CurrencyCode::new("0");
         let new_value = dec!(0);
 
-        let mut new_tree = ServiceValueTree::new();
+        let mut new_tree = ServiceValueTree::default();
         new_tree.set_by_currency_code(
             new_service_name,
             new_service_configuration_key,
@@ -508,13 +505,13 @@ mod test {
     #[test]
     pub fn compare() {
         init_logger();
-        let mut service_value_tree = ServiceValueTree::new();
+        let mut service_value_tree = ServiceValueTree::default();
 
         let service_name = "name".into();
         let service_configuration_key = "name".into();
-        let exchange_account_id = ExchangeAccountId::new("acc_0".into(), 0);
+        let exchange_account_id = ExchangeAccountId::new("acc_0", 0);
         let currency_pair = CurrencyPair::from_codes("b_0".into(), "q_0".into());
-        let currency_code = CurrencyCode::new("0".into());
+        let currency_code = CurrencyCode::new("0");
         let value = dec!(0);
 
         service_value_tree.set_by_service_name(
@@ -546,13 +543,13 @@ mod test {
     #[should_panic(expected = "assertion failed: `(left == right)`")]
     pub fn compare_failed_by_value() {
         init_logger();
-        let mut service_value_tree = ServiceValueTree::new();
+        let mut service_value_tree = ServiceValueTree::default();
 
         let service_name = "name".into();
         let service_configuration_key = "name".into();
-        let exchange_account_id = ExchangeAccountId::new("acc_0".into(), 0);
+        let exchange_account_id = ExchangeAccountId::new("acc_0", 0);
         let currency_pair = CurrencyPair::from_codes("b_0".into(), "q_0".into());
-        let currency_code = CurrencyCode::new("0".into());
+        let currency_code = CurrencyCode::new("0");
         let value = dec!(0);
 
         service_value_tree.set_by_service_name(
@@ -584,13 +581,13 @@ mod test {
     #[should_panic(expected = "assertion failed: `(left == right)`")]
     pub fn compare_failed_by_currency_code() {
         init_logger();
-        let mut service_value_tree = ServiceValueTree::new();
+        let mut service_value_tree = ServiceValueTree::default();
 
         let service_name = "name".into();
         let service_configuration_key = "name".into();
-        let exchange_account_id = ExchangeAccountId::new("acc_0".into(), 0);
+        let exchange_account_id = ExchangeAccountId::new("acc_0", 0);
         let currency_pair = CurrencyPair::from_codes("b_0".into(), "q_0".into());
-        let currency_code = CurrencyCode::new("0".into());
+        let currency_code = CurrencyCode::new("0");
         let value = dec!(0);
 
         service_value_tree.set_by_service_name(
@@ -613,7 +610,7 @@ mod test {
             service_configuration_key,
             exchange_account_id,
             currency_pair,
-            CurrencyCode::new("1".into()),
+            CurrencyCode::new("1"),
             value,
         );
     }
@@ -622,13 +619,13 @@ mod test {
     #[should_panic(expected = "assertion failed: `(left == right)`")]
     pub fn compare_failed_by_currency_pair() {
         init_logger();
-        let mut service_value_tree = ServiceValueTree::new();
+        let mut service_value_tree = ServiceValueTree::default();
 
         let service_name = "name".into();
         let service_configuration_key = "name".into();
-        let exchange_account_id = ExchangeAccountId::new("acc_0".into(), 0);
+        let exchange_account_id = ExchangeAccountId::new("acc_0", 0);
         let currency_pair = CurrencyPair::from_codes("b_0".into(), "q_0".into());
-        let currency_code = CurrencyCode::new("0".into());
+        let currency_code = CurrencyCode::new("0");
         let value = dec!(0);
 
         service_value_tree.set_by_service_name(
@@ -660,13 +657,13 @@ mod test {
     #[should_panic(expected = "assertion failed: `(left == right)`")]
     pub fn compare_failed_by_exchange_account_id() {
         init_logger();
-        let mut service_value_tree = ServiceValueTree::new();
+        let mut service_value_tree = ServiceValueTree::default();
 
         let service_name = "name".into();
         let service_configuration_key = "name".into();
-        let exchange_account_id = ExchangeAccountId::new("acc_0".into(), 0);
+        let exchange_account_id = ExchangeAccountId::new("acc_0", 0);
         let currency_pair = CurrencyPair::from_codes("b_0".into(), "q_0".into());
-        let currency_code = CurrencyCode::new("0".into());
+        let currency_code = CurrencyCode::new("0");
         let value = dec!(0);
 
         service_value_tree.set_by_service_name(
@@ -687,7 +684,7 @@ mod test {
             service_value_tree.get(),
             service_name,
             service_configuration_key,
-            ExchangeAccountId::new("acc_0".into(), 1),
+            ExchangeAccountId::new("acc_0", 1),
             currency_pair,
             currency_code,
             value,
@@ -698,13 +695,13 @@ mod test {
     #[should_panic(expected = "assertion failed: `(left == right)`")]
     pub fn compare_failed_by_service_configuration_key() {
         init_logger();
-        let mut service_value_tree = ServiceValueTree::new();
+        let mut service_value_tree = ServiceValueTree::default();
 
         let service_name = "name".into();
         let service_configuration_key = "name".into();
-        let exchange_account_id = ExchangeAccountId::new("acc_0".into(), 0);
+        let exchange_account_id = ExchangeAccountId::new("acc_0", 0);
         let currency_pair = CurrencyPair::from_codes("b_0".into(), "q_0".into());
-        let currency_code = CurrencyCode::new("0".into());
+        let currency_code = CurrencyCode::new("0");
         let value = dec!(0);
 
         service_value_tree.set_by_service_name(
@@ -736,13 +733,13 @@ mod test {
     #[should_panic(expected = "assertion failed: `(left == right)`")]
     pub fn compare_failed_by_service_name() {
         init_logger();
-        let mut service_value_tree = ServiceValueTree::new();
+        let mut service_value_tree = ServiceValueTree::default();
 
         let service_name = "name".into();
         let service_configuration_key = "name".into();
-        let exchange_account_id = ExchangeAccountId::new("acc_0".into(), 0);
+        let exchange_account_id = ExchangeAccountId::new("acc_0", 0);
         let currency_pair = CurrencyPair::from_codes("b_0".into(), "q_0".into());
-        let currency_code = CurrencyCode::new("0".into());
+        let currency_code = CurrencyCode::new("0");
         let value = dec!(0);
 
         service_value_tree.set_by_service_name(
@@ -791,6 +788,7 @@ mod test {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assert_tree_item_eq_with_message(
         tree: &ConfigurationKeyByServiceName,
         service_name: ServiceName,

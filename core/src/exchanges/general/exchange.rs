@@ -1,65 +1,60 @@
-use std::sync::{Arc, Weak};
-
-use anyhow::{bail, Context, Error, Result};
-use dashmap::DashMap;
-use futures::FutureExt;
-use itertools::Itertools;
-use log::log;
-use mmb_utils::cancellation_token::CancellationToken;
-use mmb_utils::send_expected::SendExpectedByRef;
-use mmb_utils::{nothing_to_do, DateTime};
-use parking_lot::Mutex;
-use rust_decimal::Decimal;
-use serde_json::Value;
-use tokio::sync::{broadcast, oneshot};
-
-use super::commission::Commission;
 use super::polling_timeout_manager::PollingTimeoutManager;
-use super::symbol::Symbol;
-use crate::connectivity::connectivity_manager::GetWSParamsCallback;
-use crate::exchanges::common::{ActivePosition, ClosedPosition, SpecificCurrencyPair, TradePlace};
-use crate::exchanges::events::{
-    BalanceUpdateEvent, ExchangeBalance, ExchangeBalancesAndPositions, ExchangeEvent,
-    LiquidationPriceEvent, Trade,
+use crate::balance::manager::balance_manager::BalanceManager;
+use crate::connectivity::{
+    websocket_open, ConnectivityError, WebSocketParams, WebSocketRole, WsSender,
 };
-use crate::exchanges::general::features::{BalancePositionOption, ExchangeFeatures};
+use crate::database::events::recorder::EventRecorder;
+use crate::exchanges::block_reasons::WEBSOCKET_DISCONNECTED;
+use crate::exchanges::exchange_blocker::{BlockType, ExchangeBlocker};
+use crate::exchanges::general::features::ExchangeFeatures;
 use crate::exchanges::general::order::cancel::CancelOrderResult;
 use crate::exchanges::general::order::create::CreateOrderResult;
 use crate::exchanges::general::request_type::RequestType;
 use crate::exchanges::timeouts::requests_timeout_manager_factory::RequestTimeoutArguments;
 use crate::exchanges::timeouts::timeout_manager::TimeoutManager;
-use crate::misc::derivative_position::DerivativePosition;
+use crate::exchanges::traits::{ExchangeClient, ExchangeError};
+use crate::infrastructure::spawn_future;
+use crate::lifecycle::app_lifetime_manager::AppLifetimeManager;
 use crate::misc::time::time_manager;
 use crate::orders::buffered_fills::buffered_canceled_orders_manager::BufferedCanceledOrdersManager;
 use crate::orders::buffered_fills::buffered_fills_manager::BufferedFillsManager;
-use crate::orders::event::OrderEventType;
-use crate::orders::order::{OrderHeader, OrderSide};
-use crate::orders::pool::OrdersPool;
-use crate::orders::{order::ExchangeOrderId, pool::OrderRef};
-use crate::{
-    connectivity::connectivity_manager::WebSocketRole,
-    exchanges::common::ExchangeAccountId,
-    exchanges::{
-        common::CurrencyPair,
-        common::{ExchangeError, ExchangeErrorType, RestRequestOutcome},
-        traits::ExchangeClient,
-    },
-    lifecycle::application_manager::ApplicationManager,
+use anyhow::{bail, Context, Result};
+use dashmap::DashMap;
+use function_name::named;
+use futures::future::join_all;
+use itertools::Itertools;
+use mmb_database::impl_event;
+use mmb_domain::events::{
+    BalanceUpdateEvent, ExchangeBalancesAndPositions, ExchangeEvent, LiquidationPriceEvent,
+    MetricsEvent, MetricsEventInfo, MetricsEventInfoBase, MetricsEventType, MetricsTime, Trade,
 };
-
-use crate::balance_manager::balance_manager::BalanceManager;
-use crate::{
-    connectivity::{
-        connectivity_manager::ConnectivityManager, websocket_connection::WebSocketParams,
-    },
-    orders::order::ClientOrderId,
+use mmb_domain::exchanges::commission::Commission;
+use mmb_domain::exchanges::symbol::Symbol;
+use mmb_domain::market::{
+    CurrencyCode, CurrencyPair, ExchangeAccountId, MarketId, SpecificCurrencyPair,
 };
-use crate::{
-    exchanges::common::{Amount, CurrencyCode, Price},
-    orders::event::OrderEvent,
-};
-use hyper::StatusCode;
-use std::fmt::{Arguments, Debug, Write};
+use mmb_domain::order::event::OrderEvent;
+use mmb_domain::order::event::OrderEventType;
+use mmb_domain::order::pool::OrderRef;
+use mmb_domain::order::pool::OrdersPool;
+use mmb_domain::order::snapshot::OrderSide;
+use mmb_domain::order::snapshot::{Amount, Price};
+use mmb_domain::order::snapshot::{ClientOrderId, ExchangeOrderId};
+use mmb_domain::position::{ActivePosition, ClosedPosition, DerivativePosition};
+use mmb_utils::cancellation_token::CancellationToken;
+use mmb_utils::infrastructure::{SpawnFutureFlags, WithExpect};
+use mmb_utils::send_expected::SendExpectedByRef;
+use mmb_utils::{nothing_to_do, DateTime};
+use parking_lot::Mutex;
+use rust_decimal::Decimal;
+use serde::Serialize;
+use std::fmt::Debug;
+use std::ops::DerefMut;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+use tokio::sync::{broadcast, oneshot};
+use tokio::time::sleep;
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum RequestResult<T> {
@@ -78,11 +73,6 @@ impl<T> RequestResult<T> {
     }
 }
 
-enum CheckContent {
-    Empty,
-    Usable,
-}
-
 pub struct PriceLevel {
     pub price: Price,
     pub amount: Amount,
@@ -93,6 +83,10 @@ pub struct OrderBookTop {
     pub bid: Option<PriceLevel>,
 }
 
+#[derive(Serialize)]
+struct LiquidationPrice(Price);
+impl_event!(LiquidationPrice, "liquidation_prices");
+
 pub struct Exchange {
     pub exchange_account_id: ExchangeAccountId,
     pub symbols: DashMap<CurrencyPair, Arc<Symbol>>,
@@ -101,10 +95,10 @@ pub struct Exchange {
     pub currencies: Mutex<Vec<CurrencyCode>>,
     pub leverage_by_currency_pair: DashMap<CurrencyPair, Decimal>,
     pub order_book_top: DashMap<CurrencyPair, OrderBookTop>,
-    pub(super) exchange_client: Box<dyn ExchangeClient>,
+    pub exchange_client: BoxExchangeClient,
     pub(super) features: ExchangeFeatures,
     pub(super) events_channel: broadcast::Sender<ExchangeEvent>,
-    pub(super) application_manager: Arc<ApplicationManager>,
+    pub(super) lifetime_manager: Arc<AppLifetimeManager>,
     pub(super) commission: Commission,
     pub(super) wait_cancel_order: DashMap<ClientOrderId, broadcast::Sender<()>>,
     pub(super) wait_finish_order: DashMap<ClientOrderId, broadcast::Sender<OrderRef>>,
@@ -112,10 +106,10 @@ pub struct Exchange {
     pub(super) polling_timeout_manager: PollingTimeoutManager,
     pub(super) orders_finish_events: DashMap<ClientOrderId, oneshot::Sender<()>>,
     pub(super) orders_created_events: DashMap<ClientOrderId, oneshot::Sender<()>>,
-    pub(super) last_trades_update_time: DashMap<TradePlace, DateTime>,
-    pub(super) last_trades: DashMap<TradePlace, Trade>,
+    pub(super) last_trades_update_time: DashMap<MarketId, DateTime>,
+    pub(super) last_trades: DashMap<MarketId, Trade>,
     pub(super) timeout_manager: Arc<TimeoutManager>,
-    pub(super) balance_manager: Mutex<Option<Weak<Mutex<BalanceManager>>>>,
+    pub(crate) balance_manager: Mutex<Option<Weak<Mutex<BalanceManager>>>>,
     pub(super) buffered_fills_manager: Mutex<BufferedFillsManager>,
     pub(super) buffered_canceled_orders_manager: Mutex<BufferedCanceledOrdersManager>,
     // It allows to send and receive notification about event in websocket channel
@@ -136,185 +130,154 @@ pub struct Exchange {
             Option<oneshot::Receiver<CancelOrderResult>>,
         ),
     >,
-    connectivity_manager: Arc<ConnectivityManager>,
+    exchange_blocker: Weak<ExchangeBlocker>,
+    ws_sender: Mutex<Option<WsSender>>,
+    auto_reconnect: AtomicBool,
+
+    // Temporary fix before integration ExchangeBlocker to wait_order_finish/wait_cancel_order fallbacks #641
+    timeout: Duration,
+    // Equal 0 by default in case if we cannot get exchange server time
+    server_time_latency: AtomicI64,
+    pub event_recorder: Arc<EventRecorder>,
 }
 
 pub type BoxExchangeClient = Box<dyn ExchangeClient + Send + Sync + 'static>;
 
 impl Exchange {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         exchange_account_id: ExchangeAccountId,
-        exchange_client: BoxExchangeClient,
+        mut exchange_client: BoxExchangeClient,
+        orders: Arc<OrdersPool>,
         features: ExchangeFeatures,
         timeout_arguments: RequestTimeoutArguments,
         events_channel: broadcast::Sender<ExchangeEvent>,
-        application_manager: Arc<ApplicationManager>,
+        lifetime_manager: Arc<AppLifetimeManager>,
         timeout_manager: Arc<TimeoutManager>,
+        exchange_blocker: Weak<ExchangeBlocker>,
         commission: Commission,
+        event_recorder: Arc<EventRecorder>,
     ) -> Arc<Self> {
-        let connectivity_manager = ConnectivityManager::new(exchange_account_id);
         let polling_timeout_manager = PollingTimeoutManager::new(timeout_arguments);
 
-        let exchange = Arc::new(Self {
-            exchange_account_id,
-            exchange_client,
-            orders: OrdersPool::new(),
-            connectivity_manager,
-            order_creation_events: DashMap::new(),
-            order_cancellation_events: DashMap::new(),
-            application_manager,
-            features,
-            events_channel,
-            timeout_manager,
-            commission,
-            symbols: Default::default(),
-            currencies: Default::default(),
-            order_book_top: Default::default(),
-            wait_cancel_order: DashMap::new(),
-            wait_finish_order: DashMap::new(),
-            polling_trades_counts: DashMap::new(),
-            polling_timeout_manager,
-            orders_finish_events: DashMap::new(),
-            orders_created_events: DashMap::new(),
-            leverage_by_currency_pair: DashMap::new(),
-            last_trades_update_time: DashMap::new(),
-            last_trades: DashMap::new(),
-            balance_manager: Mutex::new(None),
-            buffered_fills_manager: Mutex::new(BufferedFillsManager::new()),
-            buffered_canceled_orders_manager: Mutex::new(BufferedCanceledOrdersManager::new()),
-        });
+        Arc::new_cyclic(move |e| {
+            Self::setup_exchange_client(e.clone(), exchange_client.as_mut());
 
-        exchange.clone().setup_connectivity_manager();
-        exchange.clone().setup_exchange_client();
-
-        exchange
+            let timeout = timeout_manager.get_period_duration(exchange_account_id);
+            Self {
+                exchange_account_id,
+                exchange_client,
+                orders,
+                ws_sender: Default::default(),
+                order_creation_events: DashMap::new(),
+                order_cancellation_events: DashMap::new(),
+                lifetime_manager,
+                features,
+                events_channel,
+                timeout_manager,
+                commission,
+                symbols: Default::default(),
+                currencies: Default::default(),
+                order_book_top: Default::default(),
+                wait_cancel_order: DashMap::new(),
+                wait_finish_order: DashMap::new(),
+                polling_trades_counts: DashMap::new(),
+                polling_timeout_manager,
+                orders_finish_events: DashMap::new(),
+                orders_created_events: DashMap::new(),
+                leverage_by_currency_pair: DashMap::new(),
+                last_trades_update_time: DashMap::new(),
+                last_trades: DashMap::new(),
+                balance_manager: Mutex::new(None),
+                buffered_fills_manager: Default::default(),
+                exchange_blocker,
+                buffered_canceled_orders_manager: Default::default(),
+                auto_reconnect: AtomicBool::new(false),
+                timeout,
+                server_time_latency: Default::default(),
+                event_recorder,
+            }
+        })
     }
 
-    fn setup_connectivity_manager(self: Arc<Self>) {
-        let exchange_weak = Arc::downgrade(&self);
-        self.connectivity_manager
-            .set_callback_msg_received(Box::new(move |data| match exchange_weak.upgrade() {
-                Some(exchange) => exchange.on_websocket_message(data),
-                None => log::info!("Unable to upgrade weak reference to Exchange instance"),
-            }));
-
-        let exchange_weak = Arc::downgrade(&self);
-        self.connectivity_manager
-            .set_callback_connecting(Box::new(move || match exchange_weak.upgrade() {
-                Some(exchange) => exchange.on_connecting(),
-                None => log::info!("Unable to upgrade weak reference to Exchange instance"),
-            }));
-    }
-
-    fn setup_exchange_client(self: Arc<Self>) {
-        let exchange_weak = Arc::downgrade(&self);
-        self.exchange_client.set_order_created_callback(Box::new(
+    fn setup_exchange_client(
+        exchange_weak: Weak<Exchange>,
+        exchange_client: &mut (dyn ExchangeClient + Send + Sync + 'static),
+    ) {
+        exchange_client.set_order_created_callback(Box::new({
+            let exchange_weak = exchange_weak.clone();
             move |client_order_id, exchange_order_id, source_type| match exchange_weak.upgrade() {
                 Some(exchange) => {
                     exchange.raise_order_created(&client_order_id, &exchange_order_id, source_type)
                 }
-                None => log::info!("Unable to upgrade weak reference to Exchange instance",),
-            },
-        ));
+                None => log::info!("Unable to upgrade weak reference to Exchange instance"),
+            }
+        }));
 
-        let exchange_weak = Arc::downgrade(&self);
-        self.exchange_client.set_order_cancelled_callback(Box::new(
+        exchange_client.set_order_cancelled_callback(Box::new({
+            let exchange_weak = exchange_weak.clone();
             move |client_order_id, exchange_order_id, source_type| match exchange_weak.upgrade() {
                 Some(exchange) => {
-                    let raise_outcome = exchange.raise_order_cancelled(
-                        client_order_id,
-                        exchange_order_id,
-                        source_type,
-                    );
-
-                    if let Err(error) = raise_outcome {
-                        let error_message = format!("Error in raise_order_cancelled: {:?}", error);
-                        log::error!("{}", error_message);
-                        exchange
-                            .application_manager
-                            .clone()
-                            .spawn_graceful_shutdown(error_message);
-                    };
+                    exchange.raise_order_cancelled(client_order_id, exchange_order_id, source_type);
                 }
-                None => log::info!("Unable to upgrade weak reference to Exchange instance",),
-            },
-        ));
+                None => log::info!("Unable to upgrade weak reference to Exchange instance"),
+            }
+        }));
 
-        let exchange_weak = Arc::downgrade(&self);
-        self.exchange_client
-            .set_handle_order_filled_callback(Box::new(move |event_data| {
-                match exchange_weak.upgrade() {
-                    Some(exchange) => {
-                        let handle_outcome = exchange.handle_order_filled(event_data);
+        exchange_client.set_handle_order_filled_callback(Box::new({
+            let exchange_weak = exchange_weak.clone();
+            move |mut event_data| match exchange_weak.upgrade() {
+                Some(exchange) => exchange.handle_order_filled(&mut event_data),
+                None => log::info!("Unable to upgrade weak reference to Exchange instance"),
+            }
+        }));
 
-                        if let Err(error) = handle_outcome {
-                            let error_message =
-                                format!("Error in handle_order_filled: {:?}", error);
-                            log::error!("{}", error_message);
-                            exchange
-                                .application_manager
-                                .clone()
-                                .spawn_graceful_shutdown(error_message);
-                        };
+        exchange_client.set_handle_trade_callback(Box::new({
+            let exchange_weak = exchange_weak.clone();
+            move |currency_pair, trade| match exchange_weak.upgrade() {
+                Some(exchange) => exchange.handle_trade(currency_pair, trade),
+                None => log::info!("Unable to upgrade weak reference to Exchange instance"),
+            }
+        }));
+
+        exchange_client.set_send_websocket_message_callback(Box::new({
+            let exchange_weak = exchange_weak.clone();
+            move |role, message| {
+                let exchange = match exchange_weak.upgrade() {
+                    None => {
+                        // some race during shutdown
+                        log::info!("Unable to upgrade weak reference to Exchange instance");
+                        return Err(ConnectivityError::NotConnected.into());
                     }
-                    None => log::info!("Unable to upgrade weak reference to Exchange instance",),
-                }
-            }));
+                    Some(exchange) => exchange,
+                };
+                exchange.forward_websocket_message(role, message)
+            }
+        }));
 
-        let exchange_weak = Arc::downgrade(&self);
-        self.exchange_client.set_handle_trade_callback(Box::new(
-            move |currency_pair, trade_id, price, quantity, order_side, transaction_time| {
-                match exchange_weak.upgrade() {
-                    Some(exchange) => {
-                        let handle_outcome = exchange.handle_trade(
-                            currency_pair,
-                            trade_id,
-                            price,
-                            quantity,
-                            order_side,
-                            transaction_time,
-                        );
-
-                        if let Err(error) = handle_outcome {
-                            let error_message = format!("Error in handle_trade: {:?}", error);
-                            log::error!("{}", error_message);
-                            exchange
-                                .application_manager
-                                .clone()
-                                .spawn_graceful_shutdown(error_message);
-                        };
-                    }
-                    None => log::info!("Unable to upgrade weak reference to Exchange instance",),
-                }
-            },
-        ));
+        exchange_client.set_handle_metrics_callback(Box::new(move |event_info| match exchange_weak
+            .upgrade()
+        {
+            Some(exchange) => {
+                exchange.handle_metrics(&event_info);
+            }
+            None => log::info!("Unable to upgrade weak reference to Exchange instance"),
+        }))
     }
 
     fn on_websocket_message(&self, msg: &str) {
-        if self
-            .application_manager
-            .stop_token()
-            .is_cancellation_requested()
-        {
-            return;
-        }
+        self.maybe_log_websocket_message(msg);
 
-        if self.exchange_client.should_log_message(msg) {
-            self.log_websocket_message(msg);
-        }
-
-        let callback_outcome = self.exchange_client.on_websocket_message(msg);
-        if let Err(error) = callback_outcome {
+        if let Err(error) = self.exchange_client.on_websocket_message(msg) {
             log::warn!(
-                "Error occurred while websocket message processing: {:?}",
-                error
+                "Error occurred while websocket message processing: {error:?}. For message: {msg}"
             );
         }
     }
 
     fn on_connecting(&self) {
         if self
-            .application_manager
+            .lifetime_manager
             .stop_token()
             .is_cancellation_requested()
         {
@@ -330,143 +293,187 @@ impl Exchange {
         }
     }
 
-    fn log_websocket_message(&self, msg: &str) {
+    fn on_connected(&self) {
+        log::info!("Exchange account id {} connected", self.exchange_account_id);
+        if let Some(exchange_blocker) = self.exchange_blocker.upgrade() {
+            exchange_blocker.unblock(self.exchange_account_id, WEBSOCKET_DISCONNECTED);
+        }
+
+        let callback_outcome = self.exchange_client.on_connected();
+        if let Err(error) = callback_outcome {
+            log::warn!(
+                "Error occurred while websocket message processing: {:?}",
+                error
+            );
+        }
+    }
+
+    fn on_disconnected(self: &Arc<Self>) {
         log::info!(
-            "Websocket message from {}: {}",
-            self.exchange_account_id,
-            msg
+            "Exchange account id {} disconnected",
+            self.exchange_account_id
         );
+
+        self.exchange_client
+            .on_disconnected()
+            .unwrap_or_else(|err| {
+                log::error!(
+                    "error handling exchange client on_disconnected on {}: {err:?}",
+                    self.exchange_account_id
+                )
+            });
+
+        if let Some(x) = self.exchange_blocker.upgrade() {
+            x.block(
+                self.exchange_account_id,
+                WEBSOCKET_DISCONNECTED,
+                BlockType::Manual,
+            );
+        }
+
+        // auto reconnect
+        if !self.auto_reconnect.load(Ordering::SeqCst) {
+            return;
+        }
+        let id = self.exchange_account_id;
+        let action = format!("Exchange account id {} reconnect", id);
+        let self_weak = Arc::downgrade(self);
+        let future = async move {
+            if let Some(self_strong) = self_weak.upgrade() {
+                if let Err(e) = self_strong.connect_ws().await {
+                    log::error!("Exchange account id {} failed to reconnect: {:?}", id, e)
+                }
+            }
+            Ok(())
+        };
+        spawn_future(&action, SpawnFutureFlags::STOP_BY_TOKEN, future);
+    }
+
+    fn maybe_log_websocket_message(&self, msg: &str) {
+        if self.exchange_client.should_log_message(msg) {
+            log::info!("Websocket message from {}: {msg}", self.exchange_account_id);
+        }
     }
 
     pub fn setup_balance_manager(&self, balance_manager: Arc<Mutex<BalanceManager>>) {
         *self.balance_manager.lock() = Some(Arc::downgrade(&balance_manager));
     }
 
-    pub async fn connect(self: Arc<Self>) {
-        self.try_connect().await;
-        // TODO Reconnect
+    pub async fn reconnect_ws(self: &Arc<Self>) -> Result<()> {
+        self.disconnect_ws().await;
+        self.connect_ws().await
     }
 
-    pub async fn disconnect(self: Arc<Self>) {
-        self.connectivity_manager.clone().disconnect().await
+    pub async fn disconnect_ws(&self) {
+        // prevent auto reconnect
+        self.auto_reconnect.store(false, Ordering::SeqCst);
+        self.ws_sender.lock().take();
     }
 
-    async fn try_connect(self: Arc<Self>) {
-        // TODO IsWebSocketConnecting()
-        log::info!("Websocket: Connecting on {}", "test_exchange_id");
-
-        // TODO if UsingWebsocket
-        // TODO handle results
-
-        let exchange_weak = Arc::downgrade(&self);
-        let get_websocket_params: GetWSParamsCallback = Box::new(move |websocket_role| {
-            exchange_weak
-                .upgrade()
-                .expect("Unable to upgrade reference to Exchange")
-                .get_websocket_params(websocket_role)
-                .boxed()
-        });
-
-        let is_enabled_secondary_websocket = self
-            .exchange_client
-            .is_websocket_enabled(WebSocketRole::Secondary);
-
-        let is_connected = self
-            .connectivity_manager
-            .clone()
-            .connect(is_enabled_secondary_websocket, get_websocket_params)
-            .await;
-
-        if !is_connected {
-            // TODO finish_connected
+    pub async fn connect_ws(self: &Arc<Self>) -> Result<()> {
+        // fire connecting callback
+        self.on_connecting();
+        // do connect
+        match self.connect_internal().await {
+            Ok(reader) => {
+                // enable auto reconnect after first success
+                self.auto_reconnect.store(true, Ordering::SeqCst);
+                spawn_future(
+                    &format!("Exchange account id {} reader", self.exchange_account_id),
+                    SpawnFutureFlags::STOP_BY_TOKEN,
+                    Self::reader_future(Arc::downgrade(self), reader),
+                );
+                self.on_connected();
+                Ok(())
+            }
+            Err(e) => {
+                self.on_disconnected();
+                Err(e.into())
+            }
         }
-        // TODO all other logs and finish_connected
     }
 
-    pub(crate) fn get_rest_error(&self, response: &RestRequestOutcome) -> Option<ExchangeError> {
-        self.get_rest_error_main(response, format_args!(""))
-    }
-
-    pub(super) fn get_rest_error_order(
-        &self,
-        response: &RestRequestOutcome,
-        order_header: &OrderHeader,
-    ) -> Option<ExchangeError> {
-        let client_order_id = &order_header.client_order_id;
-        let exchange_account_id = &order_header.exchange_account_id;
-        self.get_rest_error_main(
-            response,
-            format_args!("order {} {}", client_order_id, exchange_account_id),
-        )
-    }
-
-    pub fn get_rest_error_main(
-        &self,
-        response: &RestRequestOutcome,
-        log_template: Arguments,
-    ) -> Option<ExchangeError> {
-        use ExchangeErrorType::*;
-
-        let error = match response.status {
-            StatusCode::UNAUTHORIZED => {
-                ExchangeError::new(Authentication, response.content.clone(), None)
-            }
-            StatusCode::GATEWAY_TIMEOUT | StatusCode::SERVICE_UNAVAILABLE => {
-                ExchangeError::new(ServiceUnavailable, response.content.clone(), None)
-            }
-            StatusCode::TOO_MANY_REQUESTS => {
-                ExchangeError::new(RateLimit, response.content.clone(), None)
-            }
-            _ => match Self::check_content(&response.content) {
-                CheckContent::Empty => {
-                    if self.features.empty_response_is_ok {
-                        return None;
-                    }
-
-                    ExchangeError::new(Unknown, "Empty response".to_owned(), None)
+    /// Read websocket messages and forward to upstream callbacks
+    async fn reader_future(
+        instance: Weak<Self>,
+        mut reader: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Result<()> {
+        while let Some(msg) = reader.recv().await {
+            match instance.upgrade() {
+                Some(strong) => strong.on_websocket_message(&msg),
+                None => {
+                    // Exchange doesn't exist
+                    return Ok(());
                 }
-                CheckContent::Usable => match self.exchange_client.is_rest_error_code(response) {
-                    Ok(_) => return None,
-                    Err(mut error) => match error.error_type {
-                        ParsingError => error,
-                        _ => {
-                            // TODO For Aax Pending time should be received inside clarify_error_type
-                            self.exchange_client.clarify_error_type(&mut error);
-                            error
-                        }
-                    },
-                },
-            },
-        };
+            }
+        }
 
-        let extra_data_len = 512; // just apriori estimation
-        let mut msg = String::with_capacity(error.message.len() + extra_data_len);
-        write!(
-            &mut msg,
-            "Response has an error {:?}, on {}: {:?}",
-            error.error_type, self.exchange_account_id, error
-        )
-        .expect("Writing rest error");
+        // channel exhausted, so, disconnected
+        if let Some(strong) = instance.upgrade() {
+            strong.on_disconnected()
+        }
 
-        write!(&mut msg, " {}", log_template).expect("Writing rest error");
-
-        let log_level = match error.error_type {
-            RateLimit | Authentication | InsufficientFunds | InvalidOrder => log::Level::Error,
-            _ => log::Level::Warn,
-        };
-
-        log!(log_level, "{}. Response: {:?}", &msg, response);
-
-        // TODO some HandleRestError via BotBase
-
-        Some(error)
+        Ok(())
     }
 
-    fn check_content(content: &str) -> CheckContent {
-        if content.is_empty() {
-            CheckContent::Empty
+    /// Actual connect function, all internal work here.
+    async fn connect_internal(
+        self: &Arc<Self>,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<String>, ConnectivityError> {
+        log::info!("Websocket: Connecting on {}", self.exchange_account_id);
+
+        if !self
+            .exchange_client
+            .is_websocket_enabled(WebSocketRole::Main)
+        {
+            // no websockets - is it ok? probably not!
+            log::info!("Main websocket disabled for {}", self.exchange_account_id);
+            return Err(ConnectivityError::FailedToGetParams(
+                WebSocketRole::Main,
+                "parameters doesn't set".to_owned(),
+            ));
+        };
+
+        let main = self
+            .get_websocket_params(WebSocketRole::Main)
+            .await
+            .map_err(|e| {
+                ConnectivityError::FailedToGetParams(WebSocketRole::Main, e.to_string())
+            })?;
+
+        let secondary = if self
+            .exchange_client
+            .is_websocket_enabled(WebSocketRole::Secondary)
+        {
+            let params = self
+                .get_websocket_params(WebSocketRole::Secondary)
+                .await
+                .map_err(|e| {
+                    ConnectivityError::FailedToGetParams(WebSocketRole::Secondary, e.to_string())
+                })?;
+            Some(params)
         } else {
-            CheckContent::Usable
+            log::info!(
+                "Secondary websocket disabled for {}",
+                self.exchange_account_id
+            );
+            None
+        };
+        let (tx, rx) = websocket_open(self.exchange_account_id, main, secondary).await?;
+        self.ws_sender.lock().replace(tx);
+        Ok(rx)
+    }
+
+    fn forward_websocket_message(&self, role: WebSocketRole, msg: String) -> Result<()> {
+        let mut locked = self.ws_sender.lock();
+        if let Some(sender) = locked.deref_mut() {
+            match role {
+                WebSocketRole::Main => sender.send_main(msg),
+                WebSocketRole::Secondary => sender.send_secondary(msg),
+            }
+            .map_err(|e| e.into())
+        } else {
+            Err(ConnectivityError::NotConnected.into())
         }
     }
 
@@ -478,43 +485,8 @@ impl Exchange {
         Ok(())
     }
 
-    pub(super) fn handle_parse_error(
-        &self,
-        error: Error,
-        response: &RestRequestOutcome,
-        log_template: String,
-        args_to_log: Option<Vec<String>>,
-    ) -> Result<()> {
-        let content = &response.content;
-        let log_event_level = match serde_json::from_str::<Value>(content) {
-            Ok(_) => log::Level::Error,
-            Err(_) => log::Level::Warn,
-        };
-
-        let mut msg_to_log = format!(
-            "Error parsing response {}, on {}: {}. Error: {:?}",
-            log_template,
-            self.exchange_account_id,
-            content,
-            error.to_string()
-        );
-
-        if let Some(args) = args_to_log {
-            msg_to_log = format!(" {} with args: {:?}", msg_to_log, args);
-        }
-
-        // TODO Add some other fields as Exchange::Id, Exchange::Name
-        log!(log_event_level, "{}.", msg_to_log,);
-
-        if log_event_level == log::Level::Error {
-            bail!("{}", msg_to_log);
-        }
-
-        Ok(())
-    }
-
     pub async fn get_websocket_params(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         role: WebSocketRole,
     ) -> Result<WebSocketParams> {
         let ws_url = self.exchange_client.create_ws_url(role).await?;
@@ -523,21 +495,18 @@ impl Exchange {
 
     pub(crate) fn add_event_on_order_change(
         &self,
-        order_ref: &OrderRef,
+        order: &OrderRef,
         event_type: OrderEventType,
     ) -> Result<()> {
         if let OrderEventType::CancelOrderSucceeded = event_type {
-            order_ref.fn_mut(|order| order.internal_props.was_cancellation_event_raised = true)
+            order.fn_mut(|order| order.internal_props.was_cancellation_event_raised = true)
         }
 
-        if order_ref.is_finished() {
-            let _ = self
-                .orders
-                .not_finished
-                .remove(&order_ref.client_order_id());
+        if order.is_finished() {
+            let _ = self.orders.not_finished.remove(&order.client_order_id());
         }
 
-        let event = ExchangeEvent::OrderEvent(OrderEvent::new(order_ref.clone(), event_type));
+        let event = ExchangeEvent::OrderEvent(OrderEvent::new(order.clone(), event_type));
         self.events_channel
             .send(event)
             .context("Unable to send event. Probably receiver is already dropped")?;
@@ -553,9 +522,8 @@ impl Exchange {
         match self.get_open_orders(add_missing_open_orders).await {
             Err(error) => {
                 log::error!(
-                    "Unable to get opened order for exchange account id {}: {:?}",
-                    self.exchange_account_id,
-                    error,
+                    "Unable to get opened order for {}: {error:?}",
+                    self.exchange_account_id
                 );
             }
             Ok(orders) => {
@@ -570,10 +538,24 @@ impl Exchange {
                                 .map(|x| x.client_order_id.as_str())
                                 .collect_vec(),
                         );
-                        ()
                     },
                 }
             }
+        }
+    }
+
+    pub async fn close_active_positions(self: Arc<Self>, cancellation_token: CancellationToken) {
+        let positions = self.get_active_positions(cancellation_token.clone()).await;
+
+        tokio::select! {
+            _ = self.close_positions_immediately(&positions, cancellation_token.clone()) => nothing_to_do(),
+            _ = cancellation_token.when_cancelled() => {
+                log::error!(
+                    "Closing active positions for exchange account id {} was interrupted by CancellationToken for list of positions {:?}",
+                    self.exchange_account_id,
+                    positions
+                );
+            },
         }
     }
 
@@ -586,224 +568,120 @@ impl Exchange {
             .get_balance_reservation_currency_code(symbol, side)
     }
 
-    pub async fn close_position(
+    async fn close_positions_immediately(
         &self,
-        position: &ActivePosition,
-        price: Option<Price>,
-    ) -> Result<ClosedPosition> {
-        let response = self
-            .exchange_client
-            .request_close_position(position, price)
-            .await
-            .expect("request_close_position failed.");
+        positions: &[ActivePosition],
+        cancellation_token: CancellationToken,
+    ) {
+        let futures = positions
+            .iter()
+            .map(|position| self.close_position(position, None, cancellation_token.clone()));
 
-        log::info!(
-            "Close position response for {:?} {:?} {:?}",
-            position,
-            price,
-            response,
-        );
-
-        self.exchange_client.is_rest_error_code(&response)?;
-
-        self.exchange_client.parse_close_position(&response)
+        join_all(futures).await;
     }
 
-    pub async fn close_position_loop(
+    #[named]
+    pub async fn close_position(
         &self,
         position: &ActivePosition,
         price: Option<Decimal>,
         cancellation_token: CancellationToken,
-    ) -> ClosedPosition {
-        log::info!("Closing position {}", position.id);
+    ) -> Option<ClosedPosition> {
+        match self.exchange_client.get_settings().is_margin_trading {
+            true => {
+                log::info!("Closing position {}", position.id);
 
-        loop {
-            self.timeout_manager
-                .reserve_when_available(
-                    self.exchange_account_id,
-                    RequestType::GetActivePositions,
-                    None,
-                    cancellation_token.clone(),
-                )
-                .expect("Failed to reserve timeout_manager for close_position")
-                .await;
+                for retry_attempt in 1..=5 {
+                    self.timeout_manager
+                        .reserve_when_available(
+                            self.exchange_account_id,
+                            RequestType::GetActivePositions,
+                            None,
+                            cancellation_token.clone(),
+                        )
+                        .await;
 
-            log::info!("Closing position request reserved {}", position.id);
+                    log::info!("Closing position request reserved {}", position.id);
 
-            if let Ok(closed_position) = self.close_position(position, price).await {
-                log::info!("Closed position {}", position.id);
-                return closed_position;
+                    match self.exchange_client.close_position(position, price).await {
+                        Ok(closed_position) => {
+                            log::info!("Closed position {}", position.id);
+                            return Some(closed_position);
+                        }
+                        Err(error) => {
+                            print_warn(
+                                retry_attempt,
+                                function_name!(),
+                                &self.exchange_account_id,
+                                error,
+                            );
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+
+                log::warn!(
+                    "Close position with id {} for {} reached maximum retries - reconnecting",
+                    position.id,
+                    self.exchange_account_id
+                );
+
+                None
             }
+            false => panic!("Impossible to close position for non-derivative market"),
         }
     }
 
+    #[named]
     pub async fn get_active_positions(
         &self,
         cancellation_token: CancellationToken,
     ) -> Vec<ActivePosition> {
-        loop {
-            self.timeout_manager
-                .reserve_when_available(
-                    self.exchange_account_id,
-                    RequestType::GetActivePositions,
-                    None,
-                    cancellation_token.clone(),
-                )
-                .expect("Failed to reserve timeout_manager for get_active_positions")
-                .await;
+        match self.exchange_client.get_settings().is_margin_trading {
+            true => {
+                for retry_attempt in 1..=5 {
+                    self.timeout_manager
+                        .reserve_when_available(
+                            self.exchange_account_id,
+                            RequestType::GetActivePositions,
+                            None,
+                            cancellation_token.clone(),
+                        )
+                        .await;
 
-            if let Ok(positions) = self.get_active_positions_by_features().await {
-                return positions;
+                    match self.exchange_client.get_active_positions().await {
+                        Ok(positions) => return positions,
+                        Err(error) => {
+                            print_warn(
+                                retry_attempt,
+                                function_name!(),
+                                &self.exchange_account_id,
+                                error,
+                            );
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+
+                log::warn!(
+                    "Get active positions with for {} reached maximum retries - reconnecting",
+                    self.exchange_account_id
+                );
+
+                Vec::new()
             }
+            false => panic!("Impossible to get active positions for non-derivative market"),
         }
     }
 
-    pub async fn get_active_positions_by_features(&self) -> Result<Vec<ActivePosition>> {
-        match self.features.balance_position_option {
-            BalancePositionOption::IndividualRequests => self.get_active_positions_core().await,
-            BalancePositionOption::SingleRequest => {
-                let result = self.get_balance_and_positions_core().await?;
-                Ok(result
-                    .positions
-                    .context("Positions is none.")?
-                    .into_iter()
-                    .map(|x| ActivePosition::new(x))
-                    .collect_vec())
+    fn update_positions_leverage(&self, positions: &[DerivativePosition]) {
+        for position in positions {
+            if let Some(mut leverage) = self
+                .leverage_by_currency_pair
+                .get_mut(&position.currency_pair)
+            {
+                *leverage.value_mut() = position.leverage;
             }
-            BalancePositionOption::NonDerivative => {
-                // TODO Should be implemented manually closing positions for non-derivative exchanges
-                Ok(Vec::new())
-            }
-        }
-    }
-
-    async fn get_active_positions_core(&self) -> Result<Vec<ActivePosition>> {
-        let response = self
-            .exchange_client
-            .request_get_position()
-            .await
-            .expect("request_close_position failed.");
-
-        log::info!(
-            "get_positions response on {:?} {:?}",
-            self.exchange_account_id,
-            response,
-        );
-
-        self.exchange_client.is_rest_error_code(&response)?;
-
-        Ok(self.exchange_client.parse_get_position(&response))
-    }
-
-    pub(super) async fn get_balance_core(&self) -> Result<ExchangeBalancesAndPositions> {
-        let response = self.exchange_client.request_get_balance().await?;
-
-        log::info!(
-            "get_balance_core response on {:?} {:?}",
-            self.exchange_account_id,
-            response,
-        );
-
-        self.exchange_client.is_rest_error_code(&response)?;
-
-        Ok(self.exchange_client.parse_get_balance(&response))
-    }
-
-    async fn get_balance_and_positions(
-        &self,
-        cancellation_token: CancellationToken,
-    ) -> Result<ExchangeBalancesAndPositions> {
-        self.timeout_manager
-            .reserve_when_available(
-                self.exchange_account_id,
-                RequestType::GetBalance,
-                None,
-                cancellation_token.clone(),
-            )?
-            .await;
-
-        let balance_result = match self.features.balance_position_option {
-            BalancePositionOption::NonDerivative => return self.get_balance_core().await,
-            BalancePositionOption::SingleRequest => self.get_balance_and_positions_core().await?,
-            BalancePositionOption::IndividualRequests => {
-                let balances_result = self.get_balance_core().await?;
-
-                if balances_result.positions.is_some() {
-                    bail!("Exchange supports SingleRequest but Individual is used")
-                }
-
-                self.timeout_manager
-                    .reserve_when_available(
-                        self.exchange_account_id,
-                        RequestType::GetActivePositions,
-                        None,
-                        cancellation_token.clone(),
-                    )?
-                    .await;
-
-                let position_result = self.get_active_positions_core().await?;
-
-                let balances = balances_result.balances;
-                let positions = position_result
-                    .into_iter()
-                    .map(|x| x.derivative)
-                    .collect_vec();
-
-                ExchangeBalancesAndPositions {
-                    balances,
-                    positions: Some(positions),
-                }
-            }
-        };
-
-        if let Some(positions) = &balance_result.positions {
-            for position in positions {
-                if let Some(mut leverage) = self
-                    .leverage_by_currency_pair
-                    .get_mut(&position.currency_pair)
-                {
-                    *leverage.value_mut() = position.leverage;
-                }
-            }
-        }
-
-        Ok(balance_result)
-    }
-
-    async fn get_balance_and_positions_core(&self) -> Result<ExchangeBalancesAndPositions> {
-        let response = self
-            .exchange_client
-            .request_get_balance_and_position()
-            .await
-            .expect("request_close_position failed.");
-
-        log::info!(
-            "get_balance_and_positions_core response on {:?} {:?}",
-            self.exchange_account_id,
-            response,
-        );
-
-        self.exchange_client.is_rest_error_code(&response)?;
-
-        Ok(self.exchange_client.parse_get_balance(&response))
-    }
-
-    /// Remove currency pairs that aren't supported by the current exchange
-    /// if all currencies aren't supported return None
-    fn remove_unknown_currency_pairs(
-        &self,
-        positions: Option<Vec<DerivativePosition>>,
-        balances: Vec<ExchangeBalance>,
-    ) -> ExchangeBalancesAndPositions {
-        let positions = positions.map(|x| {
-            x.into_iter()
-                .filter(|y| self.symbols.contains_key(&y.currency_pair))
-                .collect_vec()
-        });
-
-        ExchangeBalancesAndPositions {
-            balances,
-            positions,
         }
     }
 
@@ -823,7 +701,7 @@ impl Exchange {
                     position_info.currency_pair,
                     position_info.liquidation_price,
                     position_info.average_entry_price,
-                    position_info.side.expect("position_info.side is None"),
+                    position_info.get_side(),
                 )
             }
         }
@@ -831,50 +709,53 @@ impl Exchange {
         balances_and_positions
     }
 
+    #[named]
     pub async fn get_balance(
-        &self,
+        self: &Arc<Self>,
         cancellation_token: CancellationToken,
-    ) -> Option<ExchangeBalancesAndPositions> {
-        let print_warn = |retry_attempt: i32, error: String| {
-            log::warn!(
-                "Failed to get balance for {} on retry {}: {}",
-                self.exchange_account_id,
-                retry_attempt,
-                error
-            )
-        };
-
+    ) -> Result<ExchangeBalancesAndPositions> {
         for retry_attempt in 1..=5 {
-            let balances_and_positions = self
-                .get_balance_and_positions(cancellation_token.clone())
+            self.timeout_manager
+                .reserve_when_available(
+                    self.exchange_account_id,
+                    RequestType::GetBalance,
+                    None,
+                    cancellation_token.clone(),
+                )
                 .await;
-
-            match balances_and_positions {
-                Ok(ExchangeBalancesAndPositions {
-                    positions,
-                    balances,
-                }) => {
-                    if balances.is_empty() {
-                        (print_warn)(retry_attempt, "balances is empty".into());
+            match self.exchange_client.get_balance_and_positions().await {
+                Ok(balance_and_positions) => {
+                    if let Some(positions) = &balance_and_positions.positions {
+                        self.update_positions_leverage(positions);
+                    }
+                    if balance_and_positions.balances.is_empty() {
+                        print_warn(
+                            retry_attempt,
+                            function_name!(),
+                            &self.exchange_account_id,
+                            "balances is empty",
+                        );
                         continue;
                     }
 
-                    return Some(self.handle_balances_and_positions(
-                        self.remove_unknown_currency_pairs(positions, balances),
-                    ));
+                    return Ok(self.handle_balances_and_positions(balance_and_positions));
                 }
-                Err(error) => (print_warn)(retry_attempt, error.to_string()),
+                Err(error) => print_warn(
+                    retry_attempt,
+                    function_name!(),
+                    &self.exchange_account_id,
+                    error,
+                ),
             };
         }
 
-        log::warn!(
-            "GetBalance for {} reached maximum retries - reconnecting",
-            self.exchange_account_id
-        );
+        let exchange_account_id = self.exchange_account_id;
+        log::warn!("GetBalance for {exchange_account_id} reached maximum retries - reconnecting");
 
-        // TODO: uncomment it after implementation reconnect function
-        // await Reconnect();
-        return None;
+        match self.reconnect_ws().await {
+            Ok(()) => bail!("Can't get balances, but reconnected ws succeed"),
+            Err(err) => bail!("Can't get balances and can't reconnect ws: {err:?}"),
+        }
     }
 
     fn handle_liquidation_price(
@@ -905,11 +786,58 @@ impl Exchange {
         self.events_channel
             .send_expected(ExchangeEvent::LiquidationPrice(event));
 
-        // TODO: fix it when DataRecorder will be implemented
-        // if (exchange.IsRecordingMarketData)
-        // {
-        //     DataRecorder.Save(liquidationPrice);
-        // }
+        self.event_recorder
+            .save(LiquidationPrice(liquidation_price))
+            .expect("Failure save liquidation_price");
+    }
+
+    pub(crate) fn get_timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn get_symbol(&self, currency_pair: CurrencyPair) -> Result<Arc<Symbol>> {
+        self.symbols
+            .get(&currency_pair)
+            .with_context(|| {
+                format!(
+                    "Unsupported currency pair on {} {:?}",
+                    self.exchange_account_id, currency_pair
+                )
+            })
+            .map(|pair| pair.value().clone())
+    }
+
+    pub fn update_server_time_latency(&self, latency: i64) {
+        self.server_time_latency.store(latency, Ordering::SeqCst)
+    }
+
+    fn handle_metrics(&self, event_info: &MetricsEventInfo) {
+        let local_time_offset = match event_info.base.event_type() {
+            MetricsEventType::TradeEvent | MetricsEventType::OrderBookEvent => {
+                self.server_time_latency.load(Ordering::SeqCst)
+            }
+            MetricsEventType::MlPrediction
+            | MetricsEventType::OrderFromCreateToFill
+            | MetricsEventType::TradeToMl => 0,
+            MetricsEventType::OrderLifeCycle(_) => unimplemented!(),
+        };
+
+        self.save_metrics(&event_info.base, local_time_offset);
+    }
+
+    pub(super) fn save_metrics(
+        &self,
+        metrics_event_info: &MetricsEventInfoBase,
+        local_time_offset: MetricsTime,
+    ) {
+        let metrics_event = MetricsEvent::new(metrics_event_info, local_time_offset);
+
+        self.event_recorder.save(metrics_event).with_expect(|| {
+            format!(
+                "Failure save metrics event {:?}",
+                metrics_event_info.event_type()
+            )
+        });
     }
 }
 
@@ -921,4 +849,13 @@ pub fn get_specific_currency_pair_for_tests(
     exchange
         .exchange_client
         .get_specific_currency_pair(currency_pair)
+}
+
+fn print_warn(
+    retry_attempt: i32,
+    fn_name: &str,
+    exchange_account_id: &ExchangeAccountId,
+    error: impl Debug,
+) {
+    log::warn!("Failed to {fn_name} for {exchange_account_id} on retry {retry_attempt}: {error:?}");
 }

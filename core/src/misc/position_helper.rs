@@ -1,23 +1,24 @@
 use std::{sync::Arc, time::Duration};
 
-use futures::FutureExt;
-use mmb_utils::{cancellation_token::CancellationToken, infrastructure::FutureOutcome};
+use mmb_domain::market::MarketAccountId;
+use mmb_domain::order::snapshot::OrderSide;
+use mmb_utils::{
+    cancellation_token::CancellationToken,
+    infrastructure::{FutureOutcome, SpawnFutureFlags},
+};
 use mockall_double::double;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 #[double]
-use crate::balance_manager::balance_manager::BalanceManager;
+use crate::balance::manager::balance_manager::BalanceManager;
 #[double]
 use crate::exchanges::general::engine_api::EngineApi;
 
-use crate::{
-    exchanges::common::TradePlaceAccount, infrastructure::spawn_future_timed,
-    orders::order::OrderSide,
-};
+use crate::infrastructure::spawn_future_timed;
 
 pub fn close_position_if_needed(
-    trade_place: &TradePlaceAccount,
+    market_account_id: &MarketAccountId,
     balance_manager: Option<Arc<Mutex<BalanceManager>>>,
     engine_api: Arc<EngineApi>,
     cancellation_token: CancellationToken,
@@ -27,8 +28,8 @@ pub fn close_position_if_needed(
             if balance_manager
                 .lock()
                 .get_position(
-                    trade_place.exchange_account_id,
-                    trade_place.currency_pair,
+                    market_account_id.exchange_account_id,
+                    market_account_id.currency_pair,
                     OrderSide::Buy,
                 )
                 .is_zero()
@@ -46,11 +47,10 @@ pub fn close_position_if_needed(
         Ok(())
     };
 
-    let action_name = "Close active positions";
     Some(spawn_future_timed(
-        action_name,
-        true,
+        "Close active positions",
+        SpawnFutureFlags::STOP_BY_TOKEN | SpawnFutureFlags::DENY_CANCELLATION,
         Duration::from_secs(30),
-        action.boxed(),
+        action,
     ))
 }

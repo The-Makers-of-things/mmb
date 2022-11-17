@@ -1,44 +1,41 @@
-use anyhow::Result;
+use crate::exchanges::general::exchange::Exchange;
+use crate::exchanges::general::handlers::should_ignore_event;
+use crate::exchanges::traits::ExchangeError;
 use chrono::Utc;
-
-use crate::{
-    exchanges::common::ExchangeError, exchanges::common::ExchangeErrorType,
-    exchanges::general::exchange::Exchange, orders::event::OrderEventType,
-    orders::fill::EventSourceType, orders::order::ExchangeOrderId, orders::order::OrderStatus,
-    orders::pool::OrderRef,
-};
+use function_name::named;
+use mmb_domain::events::EventSourceType;
+use mmb_domain::market::ExchangeErrorType;
+use mmb_domain::order::event::OrderEventType;
+use mmb_domain::order::pool::OrderRef;
+use mmb_domain::order::snapshot::OrderStatus;
+use mmb_domain::order::snapshot::{ClientOrderId, ExchangeOrderId};
+use mmb_utils::infrastructure::WithExpect;
+use mmb_utils::nothing_to_do;
 
 impl Exchange {
+    #[named]
     pub(crate) fn handle_cancel_order_failed(
         &self,
         exchange_order_id: &ExchangeOrderId,
         error: ExchangeError,
         event_source_type: EventSourceType,
-    ) -> Result<()> {
-        if Self::should_ignore_event(
-            self.features.allowed_cancel_event_source_type,
-            event_source_type,
-        ) {
-            return Ok(());
+    ) {
+        log::trace!(
+            concat!("started ", function_name!(), " {} {:?} {:?}"),
+            exchange_order_id,
+            error,
+            event_source_type
+        );
+
+        let allowed_cancel_event_source_type = self.features.allowed_cancel_event_source_type;
+        if should_ignore_event(allowed_cancel_event_source_type, event_source_type) {
+            return;
         }
 
-        match self.orders.cache_by_exchange_id.get(&exchange_order_id) {
-            None => {
-                log::error!("cancel_order_failed was called for an order which is not in the local order pool: {:?} on {}",
-                    exchange_order_id,
-                    self.exchange_account_id);
-
-                return Ok(());
-            }
-            Some(order) => self.react_based_on_order_status(
-                &order,
-                error,
-                &exchange_order_id,
-                event_source_type,
-            )?,
+        match self.orders.cache_by_exchange_id.get(exchange_order_id) {
+            None => log::error!("cancel_order_failed was called with error {error:?} for an order which is not in the local order pool: {exchange_order_id:?} on {}", self.exchange_account_id),
+            Some(order) => self.react_based_on_order_status(&order, error, exchange_order_id, event_source_type),
         }
-
-        Ok(())
     }
 
     fn react_based_on_order_status(
@@ -47,140 +44,99 @@ impl Exchange {
         error: ExchangeError,
         exchange_order_id: &ExchangeOrderId,
         event_source_type: EventSourceType,
-    ) -> Result<()> {
-        match order.status() {
-            OrderStatus::Canceled => {
-                log::warn!(
-                    "cancel_order_failed was called for already Canceled order: {} {:?} on {}",
-                    order.client_order_id(),
-                    order.exchange_order_id(),
-                    self.exchange_account_id,
-                );
-
-                return Ok(());
-            }
-            OrderStatus::Completed => {
-                log::warn!(
-                    "cancel_order_failed was called for already Completed order: {} {:?} on {}",
-                    order.client_order_id(),
-                    order.exchange_order_id(),
-                    self.exchange_account_id,
-                );
-
-                return Ok(());
-            }
+    ) {
+        let client_order_id = order.client_order_id();
+        let status = order.status();
+        match status {
+            OrderStatus::Canceled | OrderStatus::Completed => log::warn!("cancel_order_failed was called for already {status:?} order: {client_order_id} {exchange_order_id:?} on {}", self.exchange_account_id),
             _ => {
                 order.fn_mut(|order| {
-                    order.internal_props.last_cancellation_error = Some(error.error_type.clone());
+                    order.internal_props.last_cancellation_error = Some(error.error_type);
                     order.internal_props.cancellation_event_source_type = Some(event_source_type);
                 });
 
-                self.react_based_on_error_type(
-                    &order,
-                    error,
-                    &exchange_order_id,
-                    event_source_type,
-                )?;
+                self.react_based_on_error_type(order, &client_order_id, exchange_order_id, error, event_source_type);
             }
         }
-
-        Ok(())
     }
 
     fn react_based_on_error_type(
         &self,
         order: &OrderRef,
-        error: ExchangeError,
+        client_order_id: &ClientOrderId,
         exchange_order_id: &ExchangeOrderId,
+        error: ExchangeError,
         event_source_type: EventSourceType,
-    ) -> Result<()> {
+    ) {
         match error.error_type {
             ExchangeErrorType::OrderNotFound => {
-                self.handle_cancel_order_succeeded(
-                    None,
-                    &exchange_order_id,
-                    None,
-                    event_source_type,
-                )?;
-
-                return Ok(());
+                self.handle_cancel_order_succeeded(None, exchange_order_id, None, event_source_type)
             }
-            ExchangeErrorType::OrderCompleted => return Ok(()),
+            ExchangeErrorType::OrderCompleted => nothing_to_do(),
             _ => {
                 if event_source_type == EventSourceType::RestFallback {
                     // TODO Some metrics
                 }
 
-                order.fn_mut(|order| order.set_status(OrderStatus::FailedToCancel, Utc::now()));
-                self.add_event_on_order_change(&order, OrderEventType::CancelOrderFailed)?;
+                order.fn_mut(|x| x.set_status(OrderStatus::FailedToCancel, Utc::now()));
+
+                self.add_event_on_order_change(order, OrderEventType::CancelOrderFailed)
+                    .with_expect(|| format!("Failed to add event CancelOrderFailed on order change {client_order_id:?}"));
 
                 log::warn!(
-                    "Order cancellation failed: {} {:?} on {} with error: {:?} {:?} {}",
-                    order.client_order_id(),
-                    order.exchange_order_id(),
+                    "Order cancellation failed: {client_order_id} {exchange_order_id:?} on {} with error: {:?} {:?} {}",
                     self.exchange_account_id,
                     error.code,
                     error.error_type,
                     error.message
                 );
 
-                // TODO DataRecorder.save()
+                self.event_recorder
+                    .save(&mut order.deep_clone())
+                    .expect("Failure save order");
             }
         }
-
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::exchanges::events::ExchangeEvent;
-    use crate::exchanges::{common::ExchangeErrorType, general::test_helper::get_test_exchange};
-    use crate::{
-        exchanges::common::CurrencyPair,
-        exchanges::general::test_helper,
-        orders::order::OrderRole,
-        orders::order::{
-            ClientOrderId, OrderExecutionType, OrderFills, OrderHeader, OrderSide,
-            OrderSimpleProps, OrderSnapshot, OrderStatusHistory, OrderType,
-            SystemInternalOrderProps,
-        },
-        orders::pool::OrdersPool,
+    use crate::exchanges::general::test_helper;
+    use crate::exchanges::general::test_helper::get_test_exchange;
+    use mmb_domain::events::ExchangeEvent;
+    use mmb_domain::market::CurrencyPair;
+    use mmb_domain::market::ExchangeErrorType;
+    use mmb_domain::order::pool::OrdersPool;
+    use mmb_domain::order::snapshot::{
+        ClientOrderId, OrderFills, OrderHeader, OrderSide, OrderSimpleProps, OrderSnapshot,
+        OrderStatusHistory, SystemInternalOrderProps,
     };
-    use parking_lot::RwLock;
+    use mmb_domain::order::snapshot::{OrderRole, UserOrder};
     use rust_decimal_macros::dec;
     use std::mem::discriminant;
-    use std::sync::Arc;
     use tokio::sync::broadcast::error::TryRecvError;
 
-    #[test]
-    fn no_such_order_in_local_pool() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_such_order_in_local_pool() {
         // Arrange
         let (exchange, mut event_receiver) = get_test_exchange(false);
         let exchange_order_id = ExchangeOrderId::new("test".into());
         let error = ExchangeError::new(ExchangeErrorType::Unknown, "test_error".to_owned(), None);
 
         // Act
-        let ok_cause_no_such_order = exchange.handle_cancel_order_failed(
-            &exchange_order_id,
-            error,
-            EventSourceType::WebSocket,
-        );
+        exchange.handle_cancel_order_failed(&exchange_order_id, error, EventSourceType::WebSocket);
 
         // Assert
-        assert!(ok_cause_no_such_order.is_ok());
-
-        match event_receiver.try_recv() {
-            Ok(_) => assert!(false),
-            Err(error) => assert_eq!(error, TryRecvError::Empty),
-        }
+        let error = event_receiver.try_recv().expect_err("should be error");
+        assert_eq!(error, TryRecvError::Empty);
     }
 
     mod order_status {
         use super::*;
-        #[test]
-        fn order_canceled() {
+        use mmb_domain::order::snapshot::UserOrder;
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn order_canceled() {
             // Arrange
             let (exchange, mut event_receiver) = get_test_exchange(false);
             let exchange_order_id = &ExchangeOrderId::new("test".into());
@@ -193,25 +149,21 @@ mod test {
             let order_price = dec!(0.2);
             let order_role = OrderRole::Maker;
 
-            let header = OrderHeader::new(
-                client_order_id.clone(),
-                Utc::now(),
+            let header = OrderHeader::with_user_order(
+                client_order_id,
                 exchange.exchange_account_id,
                 currency_pair,
-                OrderType::Limit,
                 OrderSide::Buy,
                 order_amount,
-                OrderExecutionType::None,
+                UserOrder::limit(order_price),
                 None,
                 None,
                 "FromTest".to_owned(),
             );
             let props = OrderSimpleProps::new(
-                Some(order_price),
+                Utc::now(),
                 Some(order_role),
                 Some(exchange_order_id.clone()),
-                Default::default(),
-                Default::default(),
                 OrderStatus::Canceled,
                 None,
             );
@@ -221,29 +173,26 @@ mod test {
                 OrderFills::default(),
                 OrderStatusHistory::default(),
                 SystemInternalOrderProps::default(),
+                None,
             );
             let order_pool = OrdersPool::new();
-            let order_ref = order_pool.add_snapshot_initial(Arc::new(RwLock::new(order)));
+            let order_ref = order_pool.add_snapshot_initial(&order);
             test_helper::try_add_snapshot_by_exchange_id(&exchange, &order_ref);
 
             // Act
-            let ok_cause_no_such_order = exchange.handle_cancel_order_failed(
+            exchange.handle_cancel_order_failed(
                 exchange_order_id,
                 error,
                 EventSourceType::WebSocket,
             );
 
             // Assert
-            assert!(ok_cause_no_such_order.is_ok());
-
-            match event_receiver.try_recv() {
-                Ok(_) => assert!(false),
-                Err(error) => assert_eq!(error, TryRecvError::Empty),
-            }
+            let error = event_receiver.try_recv().expect_err("should be error");
+            assert_eq!(error, TryRecvError::Empty);
         }
 
-        #[test]
-        fn order_completed() {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn order_completed() {
             // Arrange
             let (exchange, mut event_receiver) = get_test_exchange(false);
             let exchange_order_id = ExchangeOrderId::new("test".into());
@@ -256,25 +205,21 @@ mod test {
             let order_price = dec!(0.2);
             let order_role = OrderRole::Maker;
 
-            let header = OrderHeader::new(
-                client_order_id.clone(),
-                Utc::now(),
+            let header = OrderHeader::with_user_order(
+                client_order_id,
                 exchange.exchange_account_id,
                 currency_pair,
-                OrderType::Limit,
                 OrderSide::Buy,
                 order_amount,
-                OrderExecutionType::None,
+                UserOrder::limit(order_price),
                 None,
                 None,
                 "FromTest".to_owned(),
             );
             let props = OrderSimpleProps::new(
-                Some(order_price),
+                Utc::now(),
                 Some(order_role),
                 Some(exchange_order_id.clone()),
-                Default::default(),
-                Default::default(),
                 OrderStatus::Completed,
                 None,
             );
@@ -284,35 +229,33 @@ mod test {
                 OrderFills::default(),
                 OrderStatusHistory::default(),
                 SystemInternalOrderProps::default(),
+                None,
             );
             let order_pool = OrdersPool::new();
-            let order_ref = order_pool.add_snapshot_initial(Arc::new(RwLock::new(order)));
+            let order_ref = order_pool.add_snapshot_initial(&order);
             test_helper::try_add_snapshot_by_exchange_id(&exchange, &order_ref);
 
             // Act
-            let ok_cause_no_such_order = exchange.handle_cancel_order_failed(
+            exchange.handle_cancel_order_failed(
                 &exchange_order_id,
                 error,
                 EventSourceType::WebSocket,
             );
 
             // Assert
-            assert!(ok_cause_no_such_order.is_ok());
-
-            match event_receiver.try_recv() {
-                Ok(_) => assert!(false),
-                Err(error) => assert_eq!(error, TryRecvError::Empty),
-            }
+            let error = event_receiver.try_recv().expect_err("should be error");
+            assert_eq!(error, TryRecvError::Empty);
         }
     }
 
     mod order_not_found {
         use super::*;
-        use crate::exchanges::events::ExchangeEvent;
+        use mmb_domain::events::ExchangeEvent;
+        use mmb_domain::order::snapshot::UserOrder;
         use std::mem::discriminant;
 
-        #[test]
-        fn error_type_not_found_no_event() {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn error_type_not_found_no_event() {
             // Arrange
             let (exchange, mut event_receiver) = get_test_exchange(false);
             let exchange_order_id = ExchangeOrderId::new("test".into());
@@ -323,25 +266,21 @@ mod test {
             let order_price = dec!(0.2);
             let order_role = OrderRole::Maker;
 
-            let header = OrderHeader::new(
-                client_order_id.clone(),
-                Utc::now(),
+            let header = OrderHeader::with_user_order(
+                client_order_id,
                 exchange.exchange_account_id,
                 currency_pair,
-                OrderType::Limit,
                 OrderSide::Buy,
                 order_amount,
-                OrderExecutionType::None,
+                UserOrder::limit(order_price),
                 None,
                 None,
                 "FromTest".to_owned(),
             );
             let props = OrderSimpleProps::new(
-                Some(order_price),
+                Utc::now(),
                 Some(order_role),
                 Some(exchange_order_id.clone()),
-                Default::default(),
-                Default::default(),
                 Default::default(),
                 None,
             );
@@ -351,10 +290,11 @@ mod test {
                 OrderFills::default(),
                 OrderStatusHistory::default(),
                 SystemInternalOrderProps::default(),
+                None,
             );
             let order_pool = OrdersPool::new();
             order.internal_props.is_canceling_from_wait_cancel_order = true;
-            let order_ref = order_pool.add_snapshot_initial(Arc::new(RwLock::new(order)));
+            let order_ref = order_pool.add_snapshot_initial(&order);
             test_helper::try_add_snapshot_by_exchange_id(&exchange, &order_ref);
 
             let error = ExchangeError::new(
@@ -364,15 +304,13 @@ mod test {
             );
 
             // Act
-            let ok_cause_no_such_order = exchange.handle_cancel_order_failed(
+            exchange.handle_cancel_order_failed(
                 &exchange_order_id,
                 error.clone(),
                 EventSourceType::WebSocket,
             );
 
             // Assert
-            assert!(ok_cause_no_such_order.is_ok());
-
             assert_eq!(order_ref.status(), OrderStatus::Canceled);
             assert_eq!(
                 order_ref
@@ -387,14 +325,12 @@ mod test {
                 EventSourceType::WebSocket,
             );
 
-            match event_receiver.try_recv() {
-                Ok(_) => assert!(false),
-                Err(error) => assert_eq!(error, TryRecvError::Empty),
-            }
+            let error = event_receiver.try_recv().expect_err("should be error");
+            assert_eq!(error, TryRecvError::Empty);
         }
 
-        #[test]
-        fn error_type_not_found_event_from_handler() {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn error_type_not_found_event_from_handler() {
             // Arrange
             let (exchange, mut event_receiver) = get_test_exchange(false);
             let exchange_order_id = ExchangeOrderId::new("test".into());
@@ -405,25 +341,21 @@ mod test {
             let order_price = dec!(0.2);
             let order_role = OrderRole::Maker;
 
-            let header = OrderHeader::new(
-                client_order_id.clone(),
-                Utc::now(),
+            let header = OrderHeader::with_user_order(
+                client_order_id,
                 exchange.exchange_account_id,
                 currency_pair,
-                OrderType::Limit,
                 OrderSide::Buy,
                 order_amount,
-                OrderExecutionType::None,
+                UserOrder::limit(order_price),
                 None,
                 None,
                 "FromTest".to_owned(),
             );
             let props = OrderSimpleProps::new(
-                Some(order_price),
+                Utc::now(),
                 Some(order_role),
                 Some(exchange_order_id.clone()),
-                Default::default(),
-                Default::default(),
                 Default::default(),
                 None,
             );
@@ -433,10 +365,11 @@ mod test {
                 OrderFills::default(),
                 OrderStatusHistory::default(),
                 SystemInternalOrderProps::default(),
+                None,
             );
             order.internal_props.is_canceling_from_wait_cancel_order = false;
             let order_pool = OrdersPool::new();
-            let order_ref = order_pool.add_snapshot_initial(Arc::new(RwLock::new(order)));
+            let order_ref = order_pool.add_snapshot_initial(&order);
             test_helper::try_add_snapshot_by_exchange_id(&exchange, &order_ref);
 
             let error = ExchangeError::new(
@@ -446,15 +379,13 @@ mod test {
             );
 
             // Act
-            let ok_cause_no_such_order = exchange.handle_cancel_order_failed(
+            exchange.handle_cancel_order_failed(
                 &exchange_order_id,
                 error.clone(),
                 EventSourceType::WebSocket,
             );
 
             // Assert
-            assert!(ok_cause_no_such_order.is_ok());
-
             assert_eq!(order_ref.status(), OrderStatus::Canceled);
             assert_eq!(
                 order_ref
@@ -482,8 +413,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn order_completed() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn order_completed() {
         // Arrange
         let (exchange, mut event_receiver) = get_test_exchange(false);
         let exchange_order_id = ExchangeOrderId::new("test".into());
@@ -494,25 +425,21 @@ mod test {
         let order_price = dec!(0.2);
         let order_role = OrderRole::Maker;
 
-        let header = OrderHeader::new(
-            client_order_id.clone(),
-            Utc::now(),
+        let header = OrderHeader::with_user_order(
+            client_order_id,
             exchange.exchange_account_id,
             currency_pair,
-            OrderType::Limit,
             OrderSide::Buy,
             order_amount,
-            OrderExecutionType::None,
+            UserOrder::limit(order_price),
             None,
             None,
             "FromTest".to_owned(),
         );
         let props = OrderSimpleProps::new(
-            Some(order_price),
+            Utc::now(),
             Some(order_role),
             Some(exchange_order_id.clone()),
-            Default::default(),
-            Default::default(),
             OrderStatus::Created,
             None,
         );
@@ -522,9 +449,10 @@ mod test {
             OrderFills::default(),
             OrderStatusHistory::default(),
             SystemInternalOrderProps::default(),
+            None,
         );
         let order_pool = OrdersPool::new();
-        let order_ref = order_pool.add_snapshot_initial(Arc::new(RwLock::new(order)));
+        let order_ref = order_pool.add_snapshot_initial(&order);
         test_helper::try_add_snapshot_by_exchange_id(&exchange, &order_ref);
 
         let error = ExchangeError::new(
@@ -534,15 +462,13 @@ mod test {
         );
 
         // Act
-        let ok_cause_no_such_order = exchange.handle_cancel_order_failed(
+        exchange.handle_cancel_order_failed(
             &exchange_order_id,
             error.clone(),
             EventSourceType::WebSocket,
         );
 
         // Assert
-        assert!(ok_cause_no_such_order.is_ok());
-
         assert_eq!(order_ref.status(), OrderStatus::Created);
         assert_eq!(
             order_ref
@@ -557,14 +483,12 @@ mod test {
             EventSourceType::WebSocket,
         );
 
-        match event_receiver.try_recv() {
-            Ok(_) => assert!(false),
-            Err(error) => assert_eq!(error, TryRecvError::Empty),
-        }
+        let error = event_receiver.try_recv().expect_err("should be error");
+        assert_eq!(error, TryRecvError::Empty);
     }
 
-    #[test]
-    fn failed_to_cancel() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_to_cancel() {
         // Arrange
         let (exchange, mut event_receiver) = get_test_exchange(false);
         let exchange_order_id = ExchangeOrderId::new("test".into());
@@ -575,25 +499,21 @@ mod test {
         let order_price = dec!(0.2);
         let order_role = OrderRole::Maker;
 
-        let header = OrderHeader::new(
-            client_order_id.clone(),
-            Utc::now(),
+        let header = OrderHeader::with_user_order(
+            client_order_id,
             exchange.exchange_account_id,
             currency_pair,
-            OrderType::Limit,
             OrderSide::Buy,
             order_amount,
-            OrderExecutionType::None,
+            UserOrder::limit(order_price),
             None,
             None,
             "FromTest".to_owned(),
         );
         let props = OrderSimpleProps::new(
-            Some(order_price),
+            Utc::now(),
             Some(order_role),
             Some(exchange_order_id.clone()),
-            Default::default(),
-            Default::default(),
             OrderStatus::Created,
             None,
         );
@@ -603,27 +523,22 @@ mod test {
             OrderFills::default(),
             OrderStatusHistory::default(),
             SystemInternalOrderProps::default(),
-        );
-        let order_pool = OrdersPool::new();
-        let order_ref = order_pool.add_snapshot_initial(Arc::new(RwLock::new(order)));
-        test_helper::try_add_snapshot_by_exchange_id(&exchange, &order_ref);
-
-        let error = ExchangeError::new(
-            ExchangeErrorType::Authentication,
-            "Authentication error".to_owned(),
             None,
         );
+        let order_pool = OrdersPool::new();
+        let order_ref = order_pool.add_snapshot_initial(&order);
+        test_helper::try_add_snapshot_by_exchange_id(&exchange, &order_ref);
+
+        let error = ExchangeError::authentication("Authentication error".to_owned());
 
         // Act
-        let ok_cause_no_such_order = exchange.handle_cancel_order_failed(
+        exchange.handle_cancel_order_failed(
             &exchange_order_id,
             error.clone(),
             EventSourceType::WebSocket,
         );
 
         // Assert
-        assert!(ok_cause_no_such_order.is_ok());
-
         assert_eq!(order_ref.status(), OrderStatus::FailedToCancel);
         assert_eq!(
             order_ref

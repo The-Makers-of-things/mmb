@@ -1,13 +1,12 @@
-use std::fs::read_to_string;
-use std::{collections::HashMap, io::Write};
-use std::{fmt::Debug, fs::File};
-
 use crate::lifecycle::launcher::InitSettings;
-use crate::settings::{AppSettings, BaseStrategySettings};
+use crate::settings::AppSettings;
 use anyhow::{anyhow, bail, Context, Result};
 use mmb_utils::hashmap;
 use mmb_utils::infrastructure::WithExpect;
 use serde::de::DeserializeOwned;
+use std::fs::read_to_string;
+use std::{collections::HashMap, io::Write};
+use std::{fmt::Debug, fs::File};
 use toml_edit::{value, ArrayOfTables, Document, Table};
 
 pub static EXCHANGE_ACCOUNT_ID: &str = "exchange_account_id";
@@ -21,21 +20,21 @@ pub fn try_load_settings<TSettings>(
     credentials_path: &str,
 ) -> Result<AppSettings<TSettings>>
 where
-    TSettings: BaseStrategySettings + Clone + Debug + DeserializeOwned,
+    TSettings: Clone + Debug + DeserializeOwned,
 {
     let settings = read_to_string(config_path)
         .with_context(|| format!("Unable load settings file: {}", config_path))?;
     let credentials = read_to_string(credentials_path)
         .with_context(|| format!("Unable load credentials file: {}", credentials_path))?;
 
-    parse_settings(settings.as_str(), credentials.as_str())
+    parse_settings(&settings, &credentials)
 }
 
 pub fn load_pretty_settings<StrategySettings>(
     init_user_settings: InitSettings<StrategySettings>,
 ) -> String
 where
-    StrategySettings: BaseStrategySettings + Clone + serde::ser::Serialize,
+    StrategySettings: Clone + serde::ser::Serialize,
 {
     match init_user_settings {
         InitSettings::Directly(settings) => {
@@ -62,7 +61,7 @@ pub fn parse_settings<TSettings>(
     credentials: &str,
 ) -> Result<AppSettings<TSettings>>
 where
-    TSettings: BaseStrategySettings + Clone + Debug + DeserializeOwned,
+    TSettings: Clone + Debug + DeserializeOwned,
 {
     let settings =
         parse_toml_settings(settings, credentials).context("Unable parse toml settings")?;
@@ -76,13 +75,11 @@ pub fn save_settings(settings: &str, config_path: &str, credentials_path: &str) 
     // Write credentials in their own config file
     let mut credentials_per_exchange = HashMap::new();
 
-    let exchanges = get_exchanges_mut(&mut serialized_settings).ok_or(anyhow!(
-        "Unable to get core.exchanges array from gotten settings"
-    ))?;
+    let exchanges = get_exchanges_mut(&mut serialized_settings)
+        .ok_or_else(|| anyhow!("Unable to get core.exchanges array from gotten settings"))?;
     for exchange_settings in exchanges.iter_mut() {
-        let (exchange_account_id, api_key, secret_key) =
-            get_credentials_data(&exchange_settings)
-                .ok_or(anyhow!("Unable to get credentials data for exchange"))?;
+        let (exchange_account_id, api_key, secret_key) = get_credentials_data(exchange_settings)
+            .ok_or_else(|| anyhow!("Unable to get credentials data for exchange"))?;
 
         let creds = hashmap![
             API_KEY => api_key,
@@ -98,10 +95,10 @@ pub fn save_settings(settings: &str, config_path: &str, credentials_path: &str) 
 
     let serialized_creds = toml_edit::ser::to_string(&credentials_per_exchange)?;
     let mut credentials_config = File::create(credentials_path)?;
-    credentials_config.write_all(&serialized_creds.as_bytes())?;
+    credentials_config.write_all(serialized_creds.as_bytes())?;
 
     let mut main_config = File::create(config_path)?;
-    main_config.write_all(&serialized_settings.to_string().as_bytes())?;
+    main_config.write_all(serialized_settings.to_string().as_bytes())?;
 
     Ok(())
 }
@@ -121,24 +118,26 @@ fn parse_toml_settings(settings: &str, credentials: &str) -> Result<Document> {
             let exchange_account_id = exchange
                 .get(EXCHANGE_ACCOUNT_ID)
                 .and_then(|v| v.as_str())
-                .ok_or(anyhow!(
+                .ok_or_else(|| {
+                    anyhow!(
                 "Unable get 'exchange_account_id' for one of 'core.exchanges' from the settings"
-            ))?;
+            )
+                })?;
 
             let api_key = credentials
                 .get(exchange_account_id)
                 .and_then(|v| v.get(API_KEY))
                 .and_then(|v| v.as_str())
-                .ok_or(anyhow!(
-                    "Unable get 'api_key' for one of 'core.exchanges' from the settings"
-                ))?;
+                .ok_or_else(|| {
+                    anyhow!("Unable get 'api_key' for one of 'core.exchanges' from the settings")
+                })?;
             let secret_key = credentials
                 .get(exchange_account_id)
                 .and_then(|v| v.get(SECRET_KEY))
                 .and_then(|v| v.as_str())
-                .ok_or(anyhow!(
-                    "Unable get 'secret_key' for one of 'core.exchanges' from the settings"
-                ))?;
+                .ok_or_else(|| {
+                    anyhow!("Unable get 'secret_key' for one of 'core.exchanges' from the settings")
+                })?;
 
             if api_key.is_empty() || secret_key.is_empty() {
                 bail!("Unable to parse settings: api or secret key is empty")

@@ -1,20 +1,21 @@
+use mmb_domain::order::snapshot::{Amount, Price};
 use std::hash::Hash;
 use std::sync::Arc;
 
-use crate::balance_manager::balance_reservation::BalanceReservation;
-use crate::exchanges::common::{Amount, ExchangeAccountId, Price};
-use crate::exchanges::general::symbol::Symbol;
-use crate::orders::order::OrderSide;
+use crate::balance::manager::balance_reservation::BalanceReservation;
 use crate::service_configuration::configuration_descriptor::ConfigurationDescriptor;
+use mmb_domain::exchanges::symbol::Symbol;
+use mmb_domain::market::ExchangeAccountId;
+use mmb_domain::order::snapshot::OrderSide;
 
 #[derive(Clone, Hash, Debug, Eq, PartialEq)]
 pub struct ReserveParameters {
-    pub(crate) configuration_descriptor: ConfigurationDescriptor,
-    pub(crate) exchange_account_id: ExchangeAccountId,
-    pub(crate) symbol: Arc<Symbol>,
-    pub(crate) order_side: OrderSide,
     pub(crate) price: Price,
     pub(crate) amount: Amount,
+    pub(crate) order_side: OrderSide,
+    pub(crate) symbol: Arc<Symbol>,
+    pub(crate) exchange_account_id: ExchangeAccountId,
+    pub(crate) configuration_descriptor: ConfigurationDescriptor,
 }
 
 impl ReserveParameters {
@@ -38,7 +39,7 @@ impl ReserveParameters {
 
     pub fn from_reservation(reservation: &BalanceReservation, amount: Amount) -> Self {
         ReserveParameters::new(
-            reservation.configuration_descriptor.clone(),
+            reservation.configuration_descriptor,
             reservation.exchange_account_id,
             reservation.symbol.clone(),
             reservation.order_side,

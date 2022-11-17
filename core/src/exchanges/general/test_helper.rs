@@ -1,68 +1,72 @@
 #![cfg(test)]
-use std::{collections::HashMap, sync::Arc};
 
+use std::any::Any;
+use std::sync::Arc;
+
+use crate::lifecycle::app_lifetime_manager::AppLifetimeManager;
 use crate::{
-    connectivity::connectivity_manager::WebSocketRole,
+    connectivity::WebSocketRole,
     exchanges::{
-        common::{
-            ActivePosition, Amount, ClosedPosition, CurrencyCode, CurrencyId, CurrencyPair,
-            ExchangeAccountId, ExchangeError, Price, RestRequestOutcome, SpecificCurrencyPair,
-        },
-        events::{AllowedEventSourceType, ExchangeBalancesAndPositions, ExchangeEvent, TradeId},
         general::{
-            commission::{Commission, CommissionForType},
             exchange::Exchange,
             features::{
                 ExchangeFeatures, OpenOrdersType, OrderFeatures, OrderTradeOption,
                 RestFillsFeatures, WebSocketOptions,
             },
-            symbol::{Precision, Symbol},
         },
         timeouts::{
             requests_timeout_manager_factory::RequestTimeoutArguments,
             timeout_manager::TimeoutManager,
         },
-        traits::{ExchangeClient, Support},
-    },
-    lifecycle::application_manager::ApplicationManager,
-    orders::{
-        fill::EventSourceType,
-        order::{
-            ClientOrderId, ExchangeOrderId, OrderCancelling, OrderCreating, OrderInfo, OrderRole,
-            OrderSide, OrderSnapshot, OrderType,
-        },
-        pool::{OrderRef, OrdersPool},
+        traits::{ExchangeClient, HandleTradeCb, OrderCancelledCb, OrderCreatedCb, Support},
     },
     settings::ExchangeSettings,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::Duration;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use futures::executor::block_on;
+use mmb_domain::events::{AllowedEventSourceType, ExchangeBalancesAndPositions, ExchangeEvent};
+use mmb_domain::exchanges::commission::{Commission, CommissionForType};
+use mmb_domain::exchanges::symbol::{BeforeAfter, Precision, Symbol};
+use mmb_domain::market::{
+    CurrencyCode, CurrencyId, CurrencyPair, ExchangeAccountId, SpecificCurrencyPair,
+};
+use mmb_domain::order::pool::{OrderRef, OrdersPool};
+use mmb_domain::order::snapshot::{Amount, ExchangeOrderId, OrderOptions, Price};
+use mmb_domain::order::snapshot::{ClientOrderId, OrderInfo, OrderRole, OrderSide, OrderSnapshot};
+use mmb_domain::position::{ActivePosition, ClosedPosition};
 use rust_decimal_macros::dec;
 use tokio::sync::broadcast;
 use url::Url;
 
-use mmb_utils::{cancellation_token::CancellationToken, DateTime};
-
-use super::{
-    handlers::handle_order_filled::FillEventData, order::get_order_trades::OrderTrade,
-    symbol::BeforeAfter,
+use crate::database::events::recorder::EventRecorder;
+use crate::exchanges::exchange_blocker::ExchangeBlocker;
+use crate::exchanges::general::exchange::RequestResult;
+use crate::exchanges::general::order::cancel::CancelOrderResult;
+use crate::exchanges::general::order::create::CreateOrderResult;
+use crate::exchanges::timeouts::requests_timeout_manager_factory::RequestsTimeoutManagerFactory;
+use crate::exchanges::traits::{
+    ExchangeError, HandleMetricsCb, HandleOrderFilledCb, SendWebsocketMessageCb,
 };
+use mmb_utils::{cancellation_token::CancellationToken, hashmap, DateTime};
+
+use super::order::get_order_trades::OrderTrade;
 
 pub struct TestClient;
 
 #[async_trait]
 impl ExchangeClient for TestClient {
-    async fn request_all_symbols(&self) -> Result<RestRequestOutcome> {
+    async fn create_order(&self, _order: &OrderRef) -> CreateOrderResult {
         unimplemented!("doesn't need in UT")
     }
 
-    async fn create_order(&self, _order: &OrderCreating) -> Result<RestRequestOutcome> {
-        unimplemented!("doesn't need in UT")
-    }
-
-    async fn request_cancel_order(&self, _order: &OrderCancelling) -> Result<RestRequestOutcome> {
+    async fn cancel_order(
+        &self,
+        _order: &OrderRef,
+        _exchange_order_id: &ExchangeOrderId,
+    ) -> CancelOrderResult {
         unimplemented!("doesn't need in UT")
     }
 
@@ -70,60 +74,58 @@ impl ExchangeClient for TestClient {
         unimplemented!("doesn't need in UT")
     }
 
-    async fn request_open_orders(&self) -> Result<RestRequestOutcome> {
+    async fn get_open_orders(&self) -> Result<Vec<OrderInfo>> {
         unimplemented!("doesn't need in UT")
     }
 
-    async fn request_open_orders_by_currency_pair(
+    async fn get_open_orders_by_currency_pair(
         &self,
         _currency_pair: CurrencyPair,
-    ) -> Result<RestRequestOutcome> {
+    ) -> Result<Vec<OrderInfo>> {
         unimplemented!("doesn't need in UT")
     }
 
-    async fn request_order_info(&self, _order: &OrderRef) -> Result<RestRequestOutcome> {
+    async fn get_order_info(&self, _order: &OrderRef) -> Result<OrderInfo, ExchangeError> {
         unimplemented!("doesn't need in UT")
     }
 
-    async fn request_my_trades(
-        &self,
-        _symbol: &Symbol,
-        _last_date_time: Option<DateTime>,
-    ) -> Result<RestRequestOutcome> {
-        unimplemented!("doesn't need in UT")
-    }
-
-    async fn request_get_position(&self) -> Result<RestRequestOutcome> {
-        unimplemented!("doesn't need in UT")
-    }
-
-    async fn request_get_balance_and_position(&self) -> Result<RestRequestOutcome> {
-        unimplemented!("doesn't need in UT")
-    }
-
-    async fn request_get_balance(&self) -> Result<RestRequestOutcome> {
-        unimplemented!("doesn't need in UT")
-    }
-
-    async fn request_close_position(
+    async fn close_position(
         &self,
         _position: &ActivePosition,
         _price: Option<Price>,
-    ) -> Result<RestRequestOutcome> {
+    ) -> Result<ClosedPosition> {
+        unimplemented!("doesn't need in UT")
+    }
+
+    async fn get_active_positions(&self) -> Result<Vec<ActivePosition>> {
+        unimplemented!("doesn't need in UT")
+    }
+
+    async fn get_balance_and_positions(&self) -> Result<ExchangeBalancesAndPositions> {
+        unimplemented!("doesn't need in UT")
+    }
+
+    async fn get_my_trades(
+        &self,
+        _symbol: &Symbol,
+        _last_date_time: Option<DateTime>,
+    ) -> RequestResult<Vec<OrderTrade>> {
+        unimplemented!("doesn't need in UT")
+    }
+
+    async fn build_all_symbols(&self) -> Result<Vec<Arc<Symbol>>> {
+        unimplemented!("doesn't need in UT")
+    }
+
+    async fn get_server_time(&self) -> Option<Result<i64>> {
         unimplemented!("doesn't need in UT")
     }
 }
 
 #[async_trait]
 impl Support for TestClient {
-    fn is_rest_error_code(&self, _response: &RestRequestOutcome) -> Result<(), ExchangeError> {
-        unimplemented!("doesn't need in UT")
-    }
-    fn get_order_id(&self, _response: &RestRequestOutcome) -> Result<ExchangeOrderId> {
-        unimplemented!("doesn't need in UT")
-    }
-    fn clarify_error_type(&self, __error: &mut ExchangeError) {
-        unimplemented!("doesn't need in UT")
+    fn as_any(&self) -> &(dyn Any + Sync + Send + 'static) {
+        self
     }
 
     fn on_websocket_message(&self, _msg: &str) -> Result<()> {
@@ -133,31 +135,25 @@ impl Support for TestClient {
         unimplemented!("doesn't need in UT")
     }
 
-    fn set_order_created_callback(
-        &self,
-        _callback: Box<dyn FnMut(ClientOrderId, ExchangeOrderId, EventSourceType) + Send + Sync>,
-    ) {
+    fn on_connected(&self) -> Result<()> {
+        unimplemented!("doesn't need in UT")
     }
 
-    fn set_order_cancelled_callback(
-        &self,
-        _callback: Box<dyn FnMut(ClientOrderId, ExchangeOrderId, EventSourceType) + Send + Sync>,
-    ) {
+    fn on_disconnected(&self) -> Result<()> {
+        unimplemented!("doesn't need in UT")
     }
 
-    fn set_handle_order_filled_callback(
-        &self,
-        _callback: Box<dyn FnMut(FillEventData) + Send + Sync>,
-    ) {
-    }
+    fn set_send_websocket_message_callback(&mut self, _callback: SendWebsocketMessageCb) {}
 
-    fn set_handle_trade_callback(
-        &self,
-        _callback: Box<
-            dyn FnMut(CurrencyPair, TradeId, Price, Amount, OrderSide, DateTime) + Send + Sync,
-        >,
-    ) {
-    }
+    fn set_order_created_callback(&mut self, _callback: OrderCreatedCb) {}
+
+    fn set_order_cancelled_callback(&mut self, _callback: OrderCancelledCb) {}
+
+    fn set_handle_order_filled_callback(&mut self, _callback: HandleOrderFilledCb) {}
+
+    fn set_handle_trade_callback(&mut self, _callback: HandleTradeCb) {}
+
+    fn set_handle_metrics_callback(&mut self, _callback: HandleMetricsCb) {}
 
     fn set_traded_specific_currencies(&self, _currencies: Vec<SpecificCurrencyPair>) {}
 
@@ -185,16 +181,6 @@ impl Support for TestClient {
         log::info!("Unknown message for {}: {}", exchange_account_id, message);
     }
 
-    fn parse_open_orders(&self, _response: &RestRequestOutcome) -> Result<Vec<OrderInfo>> {
-        unimplemented!("doesn't need in UT")
-    }
-    fn parse_order_info(&self, _response: &RestRequestOutcome) -> Result<OrderInfo> {
-        unimplemented!("doesn't need in UT")
-    }
-    fn parse_all_symbols(&self, _response: &RestRequestOutcome) -> Result<Vec<Arc<Symbol>>> {
-        unimplemented!("doesn't need in UT")
-    }
-
     fn get_balance_reservation_currency_code(
         &self,
         symbol: Arc<Symbol>,
@@ -203,27 +189,7 @@ impl Support for TestClient {
         symbol.get_trade_code(side, BeforeAfter::Before)
     }
 
-    fn parse_get_my_trades(
-        &self,
-        _response: &RestRequestOutcome,
-        _last_date_time: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<Vec<OrderTrade>> {
-        unimplemented!("doesn't need in UT")
-    }
-
     fn get_settings(&self) -> &ExchangeSettings {
-        unimplemented!("doesn't need in UT")
-    }
-
-    fn parse_get_position(&self, _response: &RestRequestOutcome) -> Vec<ActivePosition> {
-        unimplemented!("doesn't need in UT")
-    }
-
-    fn parse_close_position(&self, _response: &RestRequestOutcome) -> Result<ClosedPosition> {
-        unimplemented!("doesn't need in UT")
-    }
-
-    fn parse_get_balance(&self, _response: &RestRequestOutcome) -> ExchangeBalancesAndPositions {
         unimplemented!("doesn't need in UT")
     }
 }
@@ -244,7 +210,6 @@ pub(crate) fn get_test_exchange_by_currency_codes_and_amount_code(
 ) -> (Arc<Exchange>, broadcast::Receiver<ExchangeEvent>) {
     let price_tick = dec!(0.1);
     let symbol = Arc::new(Symbol::new(
-        false,
         is_derivative,
         base_currency_code.into(),
         base_currency_code.into(),
@@ -284,14 +249,14 @@ pub(crate) fn get_test_exchange_by_currency_codes(
 pub(crate) fn get_test_exchange_with_symbol(
     symbol: Arc<Symbol>,
 ) -> (Arc<Exchange>, broadcast::Receiver<ExchangeEvent>) {
-    let exchange_account_id = ExchangeAccountId::new("local_exchange_account_id".into(), 0);
+    let exchange_account_id = ExchangeAccountId::new("local_exchange_account_id", 0);
     get_test_exchange_with_symbol_and_id(symbol, exchange_account_id)
 }
 pub(crate) fn get_test_exchange_with_symbol_and_id(
     symbol: Arc<Symbol>,
     exchange_account_id: ExchangeAccountId,
 ) -> (Arc<Exchange>, broadcast::Receiver<ExchangeEvent>) {
-    let application_manager = ApplicationManager::new(CancellationToken::new());
+    let lifetime_manager = AppLifetimeManager::new(CancellationToken::new());
     let (tx, rx) = broadcast::channel(10);
 
     let exchange_client = Box::new(TestClient);
@@ -301,25 +266,42 @@ pub(crate) fn get_test_exchange_with_symbol_and_id(
         CommissionForType::new(dec!(0.2), referral_reward),
     );
 
+    let exchange_blocker = ExchangeBlocker::new(vec![exchange_account_id]);
+
+    let request_timeout_manager = RequestsTimeoutManagerFactory::from_requests_per_period(
+        RequestTimeoutArguments::new(100, Duration::minutes(1)),
+        exchange_account_id,
+    );
+    let timeout_managers = hashmap![exchange_account_id => request_timeout_manager];
+    let timeout_manager = TimeoutManager::new(timeout_managers);
+    let event_recorder =
+        block_on(EventRecorder::start(None, None)).expect("Failure start EventRecorder");
+
     let exchange = Exchange::new(
         exchange_account_id,
         exchange_client,
+        OrdersPool::new(),
         ExchangeFeatures::new(
             OpenOrdersType::AllCurrencyPair,
             RestFillsFeatures::default(),
-            OrderFeatures::default(),
+            OrderFeatures {
+                supports_get_order_info_by_client_order_id: true,
+                ..OrderFeatures::default()
+            },
             OrderTradeOption::default(),
             WebSocketOptions::default(),
             false,
-            true,
+            AllowedEventSourceType::default(),
             AllowedEventSourceType::default(),
             AllowedEventSourceType::default(),
         ),
         RequestTimeoutArguments::from_requests_per_minute(1200),
         tx,
-        application_manager,
-        TimeoutManager::new(HashMap::new()),
+        lifetime_manager,
+        timeout_manager,
+        Arc::downgrade(&exchange_blocker),
         commission,
+        event_recorder,
     );
 
     exchange
@@ -346,11 +328,10 @@ pub(crate) fn create_order_ref(
 ) -> OrderRef {
     let order = OrderSnapshot::with_params(
         client_order_id.clone(),
-        OrderType::Liquidation,
+        OrderOptions::liquidation(price),
         role,
         exchange_account_id,
         currency_pair,
-        price,
         amount,
         side,
         None,
@@ -358,10 +339,10 @@ pub(crate) fn create_order_ref(
     );
 
     let order_pool = OrdersPool::new();
-    order_pool.add_snapshot_initial(Arc::new(RwLock::new(order)));
+    order_pool.add_snapshot_initial(&order);
     let order_ref = order_pool
         .cache_by_client_id
-        .get(&client_order_id)
+        .get(client_order_id)
         .expect("in test");
 
     order_ref.clone()
@@ -372,6 +353,6 @@ pub(crate) fn try_add_snapshot_by_exchange_id(exchange: &Exchange, order_ref: &O
         let _ = exchange
             .orders
             .cache_by_exchange_id
-            .insert(exchange_order_id.clone(), order_ref.clone());
+            .insert(exchange_order_id, order_ref.clone());
     }
 }

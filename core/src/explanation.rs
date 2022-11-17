@@ -1,3 +1,8 @@
+use mmb_database::impl_event;
+use mmb_domain::market::CurrencyPair;
+use mmb_domain::market::ExchangeId;
+use mmb_domain::order::snapshot::{Amount, Price};
+use serde::Serialize;
 use std::fmt::{Debug, Formatter};
 
 pub struct Reason(Option<String>);
@@ -29,6 +34,12 @@ impl From<Option<&str>> for Reason {
 #[derive(Debug, Default, Clone)]
 pub struct Explanation {
     reasons: Vec<String>,
+}
+
+impl Explanation {
+    pub(crate) fn get_reasons(&self) -> &[String] {
+        self.reasons.as_slice()
+    }
 }
 
 impl Explanation {
@@ -115,6 +126,37 @@ impl OptionExplanationAddReasonExt for Option<Explanation> {
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PriceLevelExplanation<'a> {
+    pub mode_name: String,
+    pub price: Price,
+    pub amount: Amount,
+    pub reasons: &'a [String],
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplanationSet<'a> {
+    exchange_id: ExchangeId,
+    currency_pair: CurrencyPair,
+    set: Vec<PriceLevelExplanation<'a>>,
+}
+
+impl<'a> ExplanationSet<'a> {
+    pub fn new(
+        exchange_id: ExchangeId,
+        currency_pair: CurrencyPair,
+        set: Vec<PriceLevelExplanation<'a>>,
+    ) -> Self {
+        Self {
+            exchange_id,
+            currency_pair,
+            set,
+        }
+    }
+}
+
+impl_event!(ExplanationSet<'_>, "disposition_explanations");
 
 #[cfg(test)]
 mod tests {

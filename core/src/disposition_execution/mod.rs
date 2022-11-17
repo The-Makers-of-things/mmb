@@ -1,22 +1,21 @@
 pub mod executor;
+pub mod strategy;
 pub mod trade_limit;
 mod trading_context_calculation;
 
+use crate::exchanges::timeouts::requests_timeout_manager::RequestGroupId;
+use crate::explanation::{Explanation, ExplanationSet, PriceLevelExplanation, WithExplanation};
+use enum_map::{enum_map, EnumMap};
+use itertools::Itertools;
+use mmb_domain::market::{CurrencyPair, ExchangeAccountId, ExchangeId, MarketAccountId, MarketId};
+use mmb_domain::order::pool::OrderRef;
+use mmb_domain::order::snapshot::{Amount, Price};
+use mmb_domain::order::snapshot::{ClientOrderId, OrderRole, OrderSide};
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-
-use enum_map::{enum_map, EnumMap};
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
-
-use crate::exchanges::common::{
-    Amount, CurrencyPair, ExchangeAccountId, Price, TradePlace, TradePlaceAccount,
-};
-use crate::exchanges::timeouts::requests_timeout_manager::RequestGroupId;
-use crate::explanation::{Explanation, WithExplanation};
-use crate::orders::order::{ClientOrderId, OrderRole, OrderSide};
-use crate::orders::pool::OrderRef;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SmallOrder {
@@ -55,15 +54,15 @@ pub struct TradeDisposition {
 
 impl TradeDisposition {
     pub fn new(
-        trade_place_account: TradePlaceAccount,
+        market_account_id: MarketAccountId,
         side: OrderSide,
         price: Price,
         amount: Amount,
     ) -> Self {
         TradeDisposition {
             direction: TradeDirection {
-                exchange_account_id: trade_place_account.exchange_account_id,
-                currency_pair: trade_place_account.currency_pair,
+                exchange_account_id: market_account_id.exchange_account_id,
+                currency_pair: market_account_id.currency_pair,
                 side,
             },
             order: SmallOrder::new(price, amount),
@@ -82,17 +81,17 @@ impl TradeDisposition {
         self.direction.side
     }
 
-    pub fn trade_place(&self) -> TradePlace {
+    pub fn market_id(&self) -> MarketId {
         let direction = &self.direction;
-        TradePlace::new(
+        MarketId::new(
             self.direction.exchange_account_id.exchange_id,
             direction.currency_pair,
         )
     }
 
-    pub fn trade_place_account(&self) -> TradePlaceAccount {
+    pub fn market_account_id(&self) -> MarketAccountId {
         let direction = &self.direction;
-        TradePlaceAccount::new(self.direction.exchange_account_id, direction.currency_pair)
+        MarketAccountId::new(self.direction.exchange_account_id, direction.currency_pair)
     }
 
     pub fn price(&self) -> Price {
@@ -142,6 +141,38 @@ impl TradingContext {
             // TODO use more typesafe way when it will be available for non-Copy types
             by_side: EnumMap::from_array([buy_ctx, sell_ctx]),
         }
+    }
+
+    pub(crate) fn get_explanations(
+        &self,
+        exchange_id: ExchangeId,
+        currency_pair: CurrencyPair,
+    ) -> ExplanationSet {
+        let explanations = self
+            .by_side
+            .as_slice()
+            .iter()
+            .flat_map(|x| x.estimating.iter().map(to_price_level_explanation))
+            .collect_vec();
+
+        ExplanationSet::new(exchange_id, currency_pair, explanations)
+    }
+}
+
+fn to_price_level_explanation(
+    explanation: &WithExplanation<Option<TradeCycle>>,
+) -> PriceLevelExplanation {
+    let SmallOrder { price, amount } = explanation
+        .value
+        .as_ref()
+        .map(|x| x.disposition.order)
+        .unwrap_or_else(|| SmallOrder::new(dec!(0), dec!(0)));
+
+    PriceLevelExplanation {
+        mode_name: "Disposition".to_string(),
+        price,
+        amount,
+        reasons: explanation.explanation.get_reasons(),
     }
 }
 
@@ -207,11 +238,10 @@ impl CompositeOrder {
             .iter()
             .filter_map(|(_, or)| {
                 let order = &or.order;
-                if !order.is_finished() {
-                    Some(order.fn_ref(|x| x.header.amount - x.fills.filled_amount))
-                } else {
-                    None
-                }
+                order.fn_ref(|x| match !x.is_finished() {
+                    true => Some(order.amount() - x.filled_amount()),
+                    false => None,
+                })
             })
             .sum()
     }

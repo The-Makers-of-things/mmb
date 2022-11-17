@@ -8,14 +8,14 @@ use mmb_utils::nothing_to_do;
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, oneshot};
 
-use crate::exchanges::common::ExchangeAccountId;
-use crate::exchanges::events::ExchangeEvent;
 use crate::exchanges::general::exchange::{Exchange, OrderBookTop, PriceLevel};
 use crate::lifecycle::trading_engine::Service;
-use crate::order_book::event::OrderBookEvent;
 use crate::order_book::local_snapshot_service::LocalSnapshotsService;
-use crate::orders::event::OrderEventType;
-use crate::orders::order::OrderType;
+use mmb_domain::events::ExchangeEvent;
+use mmb_domain::market::ExchangeAccountId;
+use mmb_domain::order::event::OrderEventType;
+use mmb_domain::order::snapshot::OrderType;
+use mmb_domain::order_book::event::OrderBookEvent;
 
 pub(crate) struct InternalEventsLoop {
     work_finished_receiver: Mutex<Option<oneshot::Receiver<Result<()>>>>,
@@ -48,7 +48,7 @@ impl InternalEventsLoop {
             };
 
             match event {
-                ExchangeEvent::OrderBookEvent(order_book_event) => {
+                ExchangeEvent::OrderBookEvent(ref order_book_event) => {
                     update_order_book_top_for_exchange(
                         order_book_event,
                         &mut local_snapshots_service,
@@ -79,9 +79,7 @@ impl InternalEventsLoop {
                         // TODO react on order liquidation
                     }
                 }
-                ExchangeEvent::BalanceUpdate(_) => {
-                    // TODO add update exchange balance
-                }
+                ExchangeEvent::BalanceUpdate(_) => {}
                 ExchangeEvent::LiquidationPrice(_) => {}
                 ExchangeEvent::Trades(_) => {}
             }
@@ -90,14 +88,13 @@ impl InternalEventsLoop {
 }
 
 fn update_order_book_top_for_exchange(
-    order_book_event: OrderBookEvent,
+    order_book_event: &OrderBookEvent,
     local_snapshots_service: &mut LocalSnapshotsService,
     exchanges_map: &HashMap<ExchangeAccountId, Arc<Exchange>>,
 ) {
-    let trade_place_account = local_snapshots_service.update(order_book_event);
-    if let Some(trade_place_account) = &trade_place_account {
-        let snapshot =
-            local_snapshots_service.get_snapshot_expected(trade_place_account.trade_place());
+    let market_account_id = local_snapshots_service.update(order_book_event);
+    if let Some(market_account_id) = &market_account_id {
+        let snapshot = local_snapshots_service.get_snapshot_expected(market_account_id.market_id());
 
         let order_book_top = OrderBookTop {
             ask: snapshot
@@ -109,11 +106,11 @@ fn update_order_book_top_for_exchange(
         };
 
         exchanges_map
-            .get(&trade_place_account.exchange_account_id)
+            .get(&market_account_id.exchange_account_id)
             .map(|exchange| {
                 exchange
                     .order_book_top
-                    .insert(trade_place_account.currency_pair, order_book_top)
+                    .insert(market_account_id.currency_pair, order_book_top)
             });
     }
 }

@@ -1,27 +1,27 @@
 use actix_server::ServerHandle;
 use anyhow::Result;
-use futures::{executor, future::BoxFuture};
+use futures::{executor, future::BoxFuture, FutureExt};
 use jsonrpc_core_client::{transports::ipc, RpcError};
 use mmb_rpc::rest_api::{MmbRpcClient, IPC_ADDRESS};
+use mmb_utils::logger::print_info;
 use parking_lot::Mutex;
-use std::{
-    sync::mpsc,
-    sync::Arc,
-    thread::{self, JoinHandle},
-    time::Duration,
-};
+use std::{sync::mpsc, sync::Arc, time::Duration};
 
 use super::endpoints;
-use actix_web::{dev::Server, rt, web, App, HttpResponse, HttpServer};
+use actix_web::{dev::Server, App, HttpResponse, HttpServer};
 use tokio::sync::oneshot;
 
 use actix_web::web::Data;
+use mmb_utils::cancellation_token::CancellationToken;
+use mmb_utils::infrastructure::{spawn_future, FutureOutcome, SpawnFutureFlags};
+use tokio::task::JoinHandle;
 
-pub type WebMmbRpcClient = web::Data<Arc<Mutex<Option<MmbRpcClient>>>>;
+pub type WebMmbRpcClient = Arc<tokio::sync::Mutex<Option<MmbRpcClient>>>;
+pub type DataWebMmbRpcClient = Data<WebMmbRpcClient>;
 
 pub(crate) struct ControlPanel {
     address: String,
-    client: Arc<Mutex<Option<MmbRpcClient>>>,
+    client: WebMmbRpcClient,
     server_stopper_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
     work_finished_sender: Arc<Mutex<Option<oneshot::Sender<Result<()>>>>>,
     work_finished_receiver: Arc<Mutex<Option<oneshot::Receiver<Result<()>>>>>,
@@ -30,7 +30,7 @@ pub(crate) struct ControlPanel {
 impl ControlPanel {
     pub(crate) async fn new(address: &str) -> Arc<Self> {
         let (work_finished_sender, work_finished_receiver) = oneshot::channel();
-        let client = Arc::new(Mutex::new(Self::build_rpc_client().await));
+        let client = Arc::new(tokio::sync::Mutex::new(Self::build_rpc_client().await));
 
         Arc::new(Self {
             address: address.to_owned(),
@@ -61,9 +61,9 @@ impl ControlPanel {
     }
 
     /// Start Actix Server in new thread
-    pub(crate) fn start(self: Arc<Self>) -> Result<JoinHandle<()>> {
+    pub(crate) fn start(self: Arc<Self>) -> Result<JoinHandle<FutureOutcome>> {
         let (server_stopper_tx, server_stopper_rx) = mpsc::channel::<()>();
-        *self.server_stopper_tx.lock() = Some(server_stopper_tx.clone());
+        *self.server_stopper_tx.lock() = Some(server_stopper_tx);
 
         let client = self.client.clone();
 
@@ -93,7 +93,12 @@ impl ControlPanel {
         self.clone()
             .server_stopping(server_handle, server_stopper_rx);
 
-        Ok(self.clone().start_server(server))
+        print_info(format!(
+            "ControlPanel has been started. WebUI is launched on http://{}",
+            self.address
+        ));
+
+        Ok(self.start_server(server))
     }
 
     fn server_stopping(
@@ -101,30 +106,29 @@ impl ControlPanel {
         server_handle: ServerHandle,
         server_stopper_rx: mpsc::Receiver<()>,
     ) {
-        let cloned_self = self.clone();
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             if let Err(error) = server_stopper_rx.recv() {
                 log::error!("Unable to receive signal to stop actix server: {}", error);
             }
 
             executor::block_on(server_handle.stop(true));
 
-            if let Some(work_finished_sender) = cloned_self.work_finished_sender.lock().take() {
-                if let Err(_) = work_finished_sender.send(Ok(())) {
+            if let Some(work_finished_sender) = self.work_finished_sender.lock().take() {
+                if work_finished_sender.send(Ok(())).is_err() {
                     log::error!("Unable to send notification about server stopped");
                 }
             }
         });
     }
 
-    fn start_server(self: Arc<Self>, server: Server) -> JoinHandle<()> {
-        thread::spawn(move || {
-            let system = Arc::new(rt::System::new());
-
-            system.block_on(async {
-                let _ = server;
-            });
-        })
+    fn start_server(self: Arc<Self>, server: Server) -> JoinHandle<FutureOutcome> {
+        spawn_future(
+            "start server",
+            SpawnFutureFlags::STOP_BY_TOKEN & SpawnFutureFlags::DENY_CANCELLATION,
+            async move { server.await.map_err(Into::into) }.boxed(),
+            |_, _| {},
+            CancellationToken::new(),
+        )
     }
 }
 
@@ -133,11 +137,9 @@ fn handle_rpc_error(error: RpcError) -> HttpResponse {
         RpcError::JsonRpcError(error) => {
             HttpResponse::InternalServerError().body(error.to_string())
         }
-        RpcError::ParseError(msg, error) => HttpResponse::BadRequest().body(format!(
-            "Failed to parse '{}': {}",
-            msg,
-            error.to_string()
-        )),
+        RpcError::ParseError(msg, error) => {
+            HttpResponse::BadRequest().body(format!("Failed to parse '{msg}': {error}"))
+        }
         RpcError::Timeout => HttpResponse::RequestTimeout().body("Request Timeout"),
         RpcError::Client(msg) => HttpResponse::InternalServerError().body(msg),
         RpcError::Other(error) => HttpResponse::InternalServerError().body(error.to_string()),
@@ -145,25 +147,25 @@ fn handle_rpc_error(error: RpcError) -> HttpResponse {
 }
 
 pub async fn send_request(
-    client: WebMmbRpcClient,
+    client: DataWebMmbRpcClient,
     action: impl Fn(&MmbRpcClient) -> BoxFuture<Result<String, RpcError>>,
 ) -> HttpResponse {
     let mut try_counter = 1;
 
-    async fn try_reconnect(client: WebMmbRpcClient, try_counter: i32) {
+    async fn try_reconnect(client: DataWebMmbRpcClient, try_counter: i32) {
         log::warn!(
             "Failed to send request {}, trying to reconnect...",
             try_counter
         );
-        *client.lock() = ControlPanel::build_rpc_client().await;
+        *client.lock().await = ControlPanel::build_rpc_client().await;
     }
 
     loop {
         log::info!("Trying to send request attempt {}...", try_counter);
 
-        if let Some(client) = &*client.lock() {
+        if let Some(client) = &*client.lock().await {
             match (action)(client).await {
-                Ok(response) => return HttpResponse::Ok().body(response.to_string()),
+                Ok(response) => return HttpResponse::Ok().body(response),
                 Err(err) => {
                     if try_counter > 2 {
                         return handle_rpc_error(err);

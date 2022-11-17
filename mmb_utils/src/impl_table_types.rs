@@ -78,6 +78,12 @@ struct AppendTable8Inner {
 
 pub struct AppendTable8(Mutex<AppendTable8Inner>);
 
+impl Default for AppendTable8 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Append only table for keeping small number (<= 256) of strings with different values
 /// Expected using as static table (live whole time that program work)
 impl AppendTable8 {
@@ -103,6 +109,12 @@ struct AppendTable16Inner {
 
 pub struct AppendTable16(Mutex<AppendTable16Inner>);
 
+impl Default for AppendTable16 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Append only table for keeping small number (<= 65536) of strings with different values
 /// Expected using as static table (live whole time that program work)
 impl AppendTable16 {
@@ -126,11 +138,12 @@ impl_append_table!(16);
 // serde::Deserialize
 #[macro_export]
 macro_rules! impl_table_type_raw {
-    ($ty: ident, $bits:literal) => {
-        paste::paste! {
-            #[derive(Copy, Clone, Eq, PartialEq, Hash)]
-            pub struct $ty([<u $bits>]);
-        }
+    ($ty: ident, $bits:literal, $bits_ty:ty) => {
+        // parameter `$bits_ty` added for correct work of code completions in IntelliJ Rust
+        // (we can declare `pub struct $ty($bits_ty);` without using procedural macro `paste!`)
+
+        #[derive(Copy, Clone, Eq, PartialEq, Hash)]
+        pub struct $ty($bits_ty);
 
         paste::paste! {
             #[allow(unused_qualifications)]
@@ -209,11 +222,21 @@ macro_rules! impl_table_type_raw {
     };
 }
 
+// Implement type with specified name based on AppendTable8 or AppendTable16 with methods:
+// from_raw - private constructor
+// as_str
+// new
+//
+// and implementations for traits:
+// fmt::Display
+// serde::Serialize
+// serde::Deserialize
+// From
 #[macro_export]
 #[allow(unused_qualifications)]
 macro_rules! impl_table_type {
-    ($ty: ident, $bits:literal) => {
-        mmb_utils::impl_table_type_raw!($ty, $bits);
+    ($ty: ident, $bits:literal, $bits_ty:ty) => {
+        mmb_utils::impl_table_type_raw!($ty, $bits, $bits_ty);
 
         impl $ty {
             pub fn new(value: &str) -> Self {

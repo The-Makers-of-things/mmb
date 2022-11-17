@@ -1,14 +1,16 @@
-use anyhow::{Context, Result};
 use dashmap::DashMap;
 use itertools::Itertools;
+use mmb_domain::market::CurrencyCode;
 use mmb_utils::infrastructure::WithExpect;
 use rust_decimal_macros::dec;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::exchanges::common::{CurrencyCode, CurrencyId, ExchangeAccountId};
 use crate::settings::CurrencyPairSetting;
+use mmb_domain::exchanges::symbol::Symbol;
+use mmb_domain::market::{CurrencyId, ExchangeAccountId};
 
-use super::{exchange::Exchange, symbol::Symbol};
+use super::exchange::Exchange;
 
 impl Exchange {
     pub async fn build_symbols(&self, currency_pair_settings: &Option<Vec<CurrencyPairSetting>>) {
@@ -30,7 +32,7 @@ impl Exchange {
         });
 
         self.setup_symbols(get_symbols(
-            &currency_pairs,
+            currency_pairs,
             exchange_symbols,
             self.exchange_account_id,
         ));
@@ -38,58 +40,41 @@ impl Exchange {
 
     async fn request_symbols_with_retries(&self) -> Vec<Arc<Symbol>> {
         const MAX_RETRIES: u8 = 5;
-        let mut retry = 0;
-        loop {
-            match self.build_all_symbols_core().await {
+        for retry in 0..=MAX_RETRIES {
+            match self.exchange_client.build_all_symbols().await {
                 Ok(result_symbols) => return result_symbols,
                 Err(error) => {
                     let error_message = format!(
-                        "Unable to get symbol for {}: {:?}",
-                        self.exchange_account_id, error
+                        "Unable to get symbol for {}: {error:?}",
+                        self.exchange_account_id
                     );
 
                     if retry < MAX_RETRIES {
-                        log::warn!("{}", error_message);
+                        log::warn!("{error_message}");
                     } else {
-                        panic!("{}", error_message);
+                        panic!("{error_message}");
                     }
                 }
             }
-
-            retry += 1;
-        }
-    }
-
-    async fn build_all_symbols_core(&self) -> Result<Vec<Arc<Symbol>>> {
-        let response = &self.exchange_client.request_all_symbols().await?;
-
-        if let Some(error) = self.get_rest_error(response) {
-            Err(error).context("Rest error appeared during request request_symbol")?;
         }
 
-        match self.exchange_client.parse_all_symbols(response) {
-            symbols @ Ok(_) => symbols,
-            Err(error) => {
-                self.handle_parse_error(error, response, "".into(), None)?;
-                Ok(Vec::new())
-            }
-        }
+        unreachable!()
     }
 
     fn setup_supported_currencies(&self, supported_currencies: DashMap<CurrencyCode, CurrencyId>) {
+        let supported_currencies_map = self.exchange_client.get_supported_currencies();
         for (currency_code, currency_id) in supported_currencies {
-            self.exchange_client
-                .get_supported_currencies()
-                .insert(currency_id, currency_code);
+            supported_currencies_map.insert(currency_id, currency_code);
         }
     }
 
     fn setup_symbols(&self, symbols: Vec<Arc<Symbol>>) {
-        let mut currencies = symbols
+        let currencies = symbols
             .iter()
-            .flat_map(|x| vec![x.base_currency_code, x.quote_currency_code])
+            .flat_map(|x| [x.base_currency_code, x.quote_currency_code])
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect_vec();
-        currencies.dedup();
         *self.currencies.lock() = currencies;
 
         symbols.iter().for_each(|symbol| {
@@ -136,35 +121,24 @@ fn get_matched_currency_pair(
     exchange_account_id: ExchangeAccountId,
 ) -> Option<Arc<Symbol>> {
     // currency pair symbol and currency pairs from settings should match 1 to 1
-    let settings_currency_pair = currency_pair_setting.currency_pair.as_deref();
     let filtered_symbol = exchange_symbols
         .iter()
-        .filter(|symbol| {
-            return Some(symbol.currency_pair().as_str()) == settings_currency_pair
-                || symbol.base_currency_code == currency_pair_setting.base
-                    && symbol.quote_currency_code == currency_pair_setting.quote;
+        .filter(|symbol| match currency_pair_setting {
+            CurrencyPairSetting::Specific(currency_pair) => {
+                symbol.currency_pair().as_str() == currency_pair
+            }
+            CurrencyPairSetting::Ordinary { base, quote } => {
+                symbol.base_currency_code == *base && symbol.quote_currency_code == *quote
+            }
         })
         .take(2)
         .cloned()
         .collect_vec();
 
     match filtered_symbol.as_slice() {
-        [] => {
-            log::error!(
-                "Unsupported symbol {:?} on exchange {}",
-                currency_pair_setting,
-                exchange_account_id
-            );
-        }
+        [] => log::error!("Unsupported symbol {currency_pair_setting:?} on exchange {exchange_account_id}"),
         [symbol] => return Some(symbol.clone()),
-        _ => {
-            log::error!(
-                    "Found more then 1 symbol for currency pair {:?} on exchange {}. Found symbols: {:?}",
-                    currency_pair_setting,
-                    exchange_account_id,
-                    filtered_symbol
-                );
-        }
+        _ => log::error!("Found more then 1 symbol for currency pair {currency_pair_setting:?} on exchange {exchange_account_id}. Found symbols: {filtered_symbol:?}"),
     };
 
     None

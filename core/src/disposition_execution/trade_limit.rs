@@ -1,6 +1,6 @@
 use crate::disposition_execution::TradeDisposition;
-use crate::exchanges::common::Amount;
-use crate::exchanges::general::symbol::Symbol;
+use mmb_domain::exchanges::symbol::Symbol;
+use mmb_domain::order::snapshot::Amount;
 
 pub fn is_enough_amount_and_cost(
     disposition: &TradeDisposition,
@@ -28,5 +28,5 @@ pub fn is_enough_amount_and_cost(
         log::trace!("{}", msg);
     }
 
-    return Err(msg);
+    Err(msg)
 }

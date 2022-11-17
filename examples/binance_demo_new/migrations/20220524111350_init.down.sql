@@ -1,0 +1,1 @@
+DROP TABLE liquidity_order_books;

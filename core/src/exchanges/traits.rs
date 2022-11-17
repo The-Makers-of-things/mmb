@@ -1,105 +1,185 @@
-use std::sync::Arc;
-
+use super::{
+    general::handlers::handle_order_filled::FillEvent,
+    general::order::get_order_trades::OrderTrade,
+    timeouts::requests_timeout_manager_factory::RequestTimeoutArguments,
+};
+use crate::connectivity::WebSocketRole;
+use crate::exchanges::general::exchange::BoxExchangeClient;
+use crate::exchanges::general::exchange::{Exchange, RequestResult};
+use crate::exchanges::general::features::ExchangeFeatures;
+use crate::exchanges::general::order::cancel::CancelOrderResult;
+use crate::exchanges::general::order::create::CreateOrderResult;
+use crate::exchanges::timeouts::timeout_manager::TimeoutManager;
+use crate::lifecycle::app_lifetime_manager::AppLifetimeManager;
+use crate::settings::ExchangeSettings;
 use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use mmb_domain::events::{EventSourceType, ExchangeBalancesAndPositions, MetricsEventInfo};
+use mmb_domain::events::{ExchangeEvent, Trade};
+use mmb_domain::exchanges::symbol::{BeforeAfter, Symbol};
+use mmb_domain::market::CurrencyId;
+use mmb_domain::market::{
+    CurrencyCode, CurrencyPair, ExchangeAccountId, ExchangeErrorType, ExchangeId,
+    SpecificCurrencyPair,
+};
+use mmb_domain::order::pool::{OrderRef, OrdersPool};
+use mmb_domain::order::snapshot::Price;
+use mmb_domain::order::snapshot::{
+    ClientOrderId, ExchangeOrderId, OrderInfo, OrderInfoExtensionData, OrderSide,
+};
+use mmb_domain::position::{ActivePosition, ClosedPosition};
 use mmb_utils::DateTime;
+use serde::{Deserialize, Serialize};
+use std::any::Any;
+use std::sync::Arc;
+use std::time::Duration;
+use thiserror::Error;
 use tokio::sync::broadcast;
-
-use super::{
-    common::CurrencyCode,
-    common::{
-        ActivePosition, CurrencyPair, ExchangeAccountId, ExchangeError, RestRequestOutcome,
-        SpecificCurrencyPair,
-    },
-    common::{Amount, ClosedPosition, CurrencyId, Price},
-    events::{ExchangeBalancesAndPositions, TradeId},
-    general::handlers::handle_order_filled::FillEventData,
-    general::symbol::BeforeAfter,
-    general::{order::get_order_trades::OrderTrade, symbol::Symbol},
-    timeouts::requests_timeout_manager_factory::RequestTimeoutArguments,
-};
-use crate::exchanges::events::ExchangeEvent;
-use crate::exchanges::general::features::ExchangeFeatures;
-use crate::lifecycle::application_manager::ApplicationManager;
-use crate::orders::fill::EventSourceType;
-use crate::orders::order::{
-    ClientOrderId, ExchangeOrderId, OrderCancelling, OrderCreating, OrderInfo,
-};
-use crate::settings::ExchangeSettings;
-use crate::{connectivity::connectivity_manager::WebSocketRole, orders::order::OrderSide};
-use crate::{exchanges::general::exchange::BoxExchangeClient, orders::pool::OrderRef};
 use url::Url;
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, Error)]
+#[error("Type: {error_type:?} Message: {message} Code {code:?}")]
+pub struct ExchangeError {
+    pub error_type: ExchangeErrorType,
+    pub message: String,
+    pub code: Option<i64>,
+}
+
+impl ExchangeError {
+    pub fn new(error_type: ExchangeErrorType, message: String, code: Option<i64>) -> Self {
+        Self {
+            error_type,
+            message,
+            code,
+        }
+    }
+
+    pub fn authentication(message: String) -> Self {
+        ExchangeError::new(ExchangeErrorType::Authentication, message, None)
+    }
+
+    pub fn send(err: anyhow::Error) -> Self {
+        ExchangeError::new(ExchangeErrorType::SendError, format!("{err:?}"), None)
+    }
+
+    pub fn parsing(message: String) -> Self {
+        ExchangeError::new(ExchangeErrorType::ParsingError, message, None)
+    }
+    pub fn unknown(message: &str) -> Self {
+        Self {
+            error_type: ExchangeErrorType::Unknown,
+            message: message.to_owned(),
+            code: None,
+        }
+    }
+
+    pub fn set_pending(&mut self, pending_time: Duration) {
+        self.error_type = ExchangeErrorType::PendingError(pending_time);
+    }
+}
+
+impl From<anyhow::Error> for ExchangeError {
+    fn from(err: anyhow::Error) -> Self {
+        ExchangeError::send(err)
+    }
+}
 
 // Implementation of rest API client
 #[async_trait]
 pub trait ExchangeClient: Support {
-    async fn request_all_symbols(&self) -> Result<RestRequestOutcome>;
+    async fn create_order(&self, order: &OrderRef) -> CreateOrderResult;
 
-    async fn create_order(&self, order: &OrderCreating) -> Result<RestRequestOutcome>;
-
-    async fn request_cancel_order(&self, order: &OrderCancelling) -> Result<RestRequestOutcome>;
+    /// There is an `ExchangeOrderId` as additional argument cause it's an `Option` in `OrderRef`
+    /// And there is no point to check if it's `Some(value)` cause it already must be checked in core
+    async fn cancel_order(
+        &self,
+        order: &OrderRef,
+        exchange_order_id: &ExchangeOrderId,
+    ) -> CancelOrderResult;
 
     async fn cancel_all_orders(&self, currency_pair: CurrencyPair) -> Result<()>;
 
-    async fn request_open_orders(&self) -> Result<RestRequestOutcome>;
+    async fn get_open_orders(&self) -> Result<Vec<OrderInfo>>;
 
-    async fn request_open_orders_by_currency_pair(
+    async fn get_open_orders_by_currency_pair(
         &self,
         currency_pair: CurrencyPair,
-    ) -> Result<RestRequestOutcome>;
+    ) -> Result<Vec<OrderInfo>>;
 
-    async fn request_order_info(&self, order: &OrderRef) -> Result<RestRequestOutcome>;
+    async fn get_order_info(&self, order: &OrderRef) -> Result<OrderInfo, ExchangeError>;
 
-    async fn request_my_trades(
-        &self,
-        symbol: &Symbol,
-        last_date_time: Option<DateTime>,
-    ) -> Result<RestRequestOutcome>;
-
-    async fn request_get_position(&self) -> Result<RestRequestOutcome>;
-
-    async fn request_get_balance_and_position(&self) -> Result<RestRequestOutcome>;
-
-    async fn request_get_balance(&self) -> Result<RestRequestOutcome>;
-
-    async fn request_close_position(
+    /// Must be implemented for derivative exchanges
+    /// If exchange doesn't support futures the method must call panic (unimplemented!())
+    async fn close_position(
         &self,
         position: &ActivePosition,
         price: Option<Price>,
-    ) -> Result<RestRequestOutcome>;
+    ) -> Result<ClosedPosition>;
+
+    /// Must be implemented for derivative exchanges
+    /// /// If exchange doesn't support futures the method must call panic (unimplemented!())
+    /// NOTE: we should get only open account positions
+    async fn get_active_positions(&self) -> Result<Vec<ActivePosition>>;
+
+    /// Getting only balance when spot and balance and positions when derivative
+    /// Should get both balance and positions from single request if possible
+    /// NOTE: we expect all wallet currencies balances
+    async fn get_balance_and_positions(&self) -> Result<ExchangeBalancesAndPositions>;
+
+    /// # Params
+    ///
+    /// * `from_datetime` - date from which trades are selected
+    async fn get_my_trades(
+        &self,
+        symbol: &Symbol,
+        from_datetime: Option<DateTime>,
+    ) -> RequestResult<Vec<OrderTrade>>;
+
+    async fn build_all_symbols(&self) -> Result<Vec<Arc<Symbol>>>;
+
+    /// Only for centralized exchanges
+    /// Need for server time latency calculating
+    /// Should return server time with millis accuracy
+    async fn get_server_time(&self) -> Option<Result<i64>>;
 }
+
+pub type OrderCreatedCb =
+    Box<dyn Fn(ClientOrderId, ExchangeOrderId, EventSourceType) + Send + Sync>;
+
+pub type OrderCancelledCb =
+    Box<dyn Fn(ClientOrderId, ExchangeOrderId, EventSourceType) + Send + Sync>;
+
+pub type HandleTradeCb = Box<dyn Fn(CurrencyPair, Trade) + Send + Sync>;
+
+pub type HandleOrderFilledCb = Box<dyn Fn(FillEvent) + Send + Sync>;
+
+pub type SendWebsocketMessageCb = Box<dyn Fn(WebSocketRole, String) -> Result<()> + Send + Sync>;
+
+pub type HandleMetricsCb = Box<dyn Fn(MetricsEventInfo) + Send + Sync>;
 
 #[async_trait]
 pub trait Support: Send + Sync {
-    fn is_rest_error_code(&self, response: &RestRequestOutcome) -> Result<(), ExchangeError>;
-    fn get_order_id(&self, response: &RestRequestOutcome) -> Result<ExchangeOrderId>;
-    fn clarify_error_type(&self, error: &mut ExchangeError);
+    /// Needed to call the `downcast_ref` method
+    fn as_any(&self) -> &(dyn Any + Send + Sync + 'static);
+
+    async fn initialized(&self, _exchange: Arc<Exchange>) {}
 
     fn on_websocket_message(&self, msg: &str) -> Result<()>;
     fn on_connecting(&self) -> Result<()>;
+    fn on_connected(&self) -> Result<()>;
+    fn on_disconnected(&self) -> Result<()>;
+    fn set_send_websocket_message_callback(&mut self, callback: SendWebsocketMessageCb);
 
-    fn set_order_created_callback(
-        &self,
-        callback: Box<dyn FnMut(ClientOrderId, ExchangeOrderId, EventSourceType) + Send + Sync>,
-    );
+    fn set_order_created_callback(&mut self, callback: OrderCreatedCb);
 
-    fn set_order_cancelled_callback(
-        &self,
-        callback: Box<dyn FnMut(ClientOrderId, ExchangeOrderId, EventSourceType) + Send + Sync>,
-    );
+    fn set_order_cancelled_callback(&mut self, callback: OrderCancelledCb);
 
-    fn set_handle_order_filled_callback(
-        &self,
-        callback: Box<dyn FnMut(FillEventData) + Send + Sync>,
-    );
+    fn set_handle_order_filled_callback(&mut self, callback: HandleOrderFilledCb);
 
-    fn set_handle_trade_callback(
-        &self,
-        callback: Box<
-            dyn FnMut(CurrencyPair, TradeId, Price, Amount, OrderSide, DateTime) + Send + Sync,
-        >,
-    );
+    fn set_handle_trade_callback(&mut self, callback: HandleTradeCb);
+
+    fn set_handle_metrics_callback(&mut self, callback: HandleMetricsCb);
 
     fn set_traded_specific_currencies(&self, currencies: Vec<SpecificCurrencyPair>);
 
@@ -114,12 +194,8 @@ pub trait Support: Send + Sync {
     fn should_log_message(&self, message: &str) -> bool;
 
     fn log_unknown_message(&self, exchange_account_id: ExchangeAccountId, message: &str) {
-        log::info!("Unknown message for {}: {}", exchange_account_id, message);
+        log::info!("Unknown message for {exchange_account_id}: {message}");
     }
-
-    fn parse_open_orders(&self, response: &RestRequestOutcome) -> Result<Vec<OrderInfo>>;
-    fn parse_order_info(&self, response: &RestRequestOutcome) -> Result<OrderInfo>;
-    fn parse_all_symbols(&self, response: &RestRequestOutcome) -> Result<Vec<Arc<Symbol>>>;
 
     fn get_balance_reservation_currency_code(
         &self,
@@ -129,19 +205,11 @@ pub trait Support: Send + Sync {
         symbol.get_trade_code(side, BeforeAfter::Before)
     }
 
-    fn parse_get_my_trades(
-        &self,
-        response: &RestRequestOutcome,
-        last_date_time: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<Vec<OrderTrade>>;
-
     fn get_settings(&self) -> &ExchangeSettings;
 
-    fn parse_get_position(&self, response: &RestRequestOutcome) -> Vec<ActivePosition>;
-
-    fn parse_close_position(&self, response: &RestRequestOutcome) -> Result<ClosedPosition>;
-
-    fn parse_get_balance(&self, response: &RestRequestOutcome) -> ExchangeBalancesAndPositions;
+    fn get_initial_extension_data(&self) -> Option<Box<dyn OrderInfoExtensionData>> {
+        None
+    }
 }
 
 pub struct ExchangeClientBuilderResult {
@@ -154,8 +222,12 @@ pub trait ExchangeClientBuilder {
         &self,
         exchange_settings: ExchangeSettings,
         events_channel: broadcast::Sender<ExchangeEvent>,
-        application_manager: Arc<ApplicationManager>,
+        lifetime_manager: Arc<AppLifetimeManager>,
+        timeout_manager: Arc<TimeoutManager>,
+        orders: Arc<OrdersPool>,
     ) -> ExchangeClientBuilderResult;
 
     fn get_timeout_arguments(&self) -> RequestTimeoutArguments;
+
+    fn get_exchange_id(&self) -> ExchangeId;
 }

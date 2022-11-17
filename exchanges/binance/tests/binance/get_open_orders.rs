@@ -1,12 +1,11 @@
-use mmb_core::exchanges::common::*;
-use mmb_core::exchanges::events::AllowedEventSourceType;
-use mmb_core::exchanges::general::commission::Commission;
 use mmb_core::exchanges::general::features::*;
 use mmb_core::settings::{CurrencyPairSetting, ExchangeSettings};
+use mmb_domain::events::AllowedEventSourceType;
+use mmb_domain::exchanges::commission::Commission;
 use mmb_utils::cancellation_token::CancellationToken;
 use mmb_utils::logger::init_logger;
 
-use crate::binance::binance_builder::BinanceBuilder;
+use crate::binance::binance_builder::{default_exchange_account_id, BinanceBuilder};
 use crate::get_binance_credentials_or_exit;
 use core_tests::order::OrderProxy;
 
@@ -14,59 +13,39 @@ use core_tests::order::OrderProxy;
 async fn open_orders_exists() {
     init_logger();
 
-    let exchange_account_id: ExchangeAccountId = "Binance_0".parse().expect("in test");
-    let binance_builder = match BinanceBuilder::try_new(
-        exchange_account_id,
-        CancellationToken::default(),
-        ExchangeFeatures::new(
-            OpenOrdersType::AllCurrencyPair,
-            RestFillsFeatures::default(),
-            OrderFeatures::default(),
-            OrderTradeOption::default(),
-            WebSocketOptions::default(),
-            false,
-            true,
-            AllowedEventSourceType::default(),
-            AllowedEventSourceType::default(),
-        ),
-        Commission::default(),
-        true,
-    )
-    .await
-    {
+    let binance_builder = match BinanceBuilder::build_account_0().await {
         Ok(binance_builder) => binance_builder,
         Err(_) => return,
     };
+    let exchange_account_id = binance_builder.exchange.exchange_account_id;
 
-    let first_order_proxy = OrderProxy::new(
+    let order_proxy1 = OrderProxy::new(
         exchange_account_id,
         Some("FromOpenOrdersExistsTest".to_owned()),
         CancellationToken::default(),
-        binance_builder.default_price,
+        binance_builder.min_price,
         binance_builder.min_amount,
+        binance_builder.default_currency_pair,
     );
 
-    let second_order_proxy = OrderProxy::new(
+    let order_proxy2 = OrderProxy::new(
         exchange_account_id,
         Some("FromOpenOrdersExistsTest".to_owned()),
         CancellationToken::default(),
-        binance_builder.default_price,
+        binance_builder.min_price,
         binance_builder.min_amount,
+        binance_builder.default_currency_pair,
     );
 
-    if let Err(error) = first_order_proxy
+    let _ = order_proxy1
         .create_order(binance_builder.exchange.clone())
         .await
-    {
-        assert!(false, "Create order failed with error {:?}.", error)
-    }
+        .expect("Create order1 failed with");
 
-    if let Err(error) = second_order_proxy
+    let _ = order_proxy2
         .create_order(binance_builder.exchange.clone())
         .await
-    {
-        assert!(false, "Create order failed with error {:?}.", error)
-    }
+        .expect("Create order2 failed");
 
     let all_orders = binance_builder
         .exchange
@@ -75,7 +54,7 @@ async fn open_orders_exists() {
         .await
         .expect("in test");
 
-    let _ = binance_builder
+    binance_builder
         .exchange
         .cancel_opened_orders(CancellationToken::default(), true)
         .await;
@@ -88,53 +67,45 @@ async fn open_orders_exists() {
 async fn get_open_orders_for_each_currency_pair_separately() {
     init_logger();
 
-    let exchange_account_id: ExchangeAccountId = "Binance_0".parse().expect("in test");
+    let exchange_account_id = default_exchange_account_id();
     let (api_key, secret_key) = get_binance_credentials_or_exit!();
     let mut settings = ExchangeSettings::new_short(exchange_account_id, api_key, secret_key, false);
 
-    settings.currency_pairs = Some(vec![
-        CurrencyPairSetting {
-            base: "cnd".into(),
-            quote: "btc".into(),
-            currency_pair: None,
-        },
-        CurrencyPairSetting {
-            base: "cnd".into(),
-            quote: "btc".into(),
-            currency_pair: None,
-        },
-    ]);
+    settings.currency_pairs = Some(vec![CurrencyPairSetting::Ordinary {
+        base: "btc".into(),
+        quote: "usdt".into(),
+    }]);
 
-    let binance_builder = match BinanceBuilder::try_new_with_settings(
+    let binance_builder = BinanceBuilder::try_new_with_settings(
         settings.clone(),
         exchange_account_id,
         CancellationToken::default(),
         ExchangeFeatures::new(
             OpenOrdersType::OneCurrencyPair,
             RestFillsFeatures::default(),
-            OrderFeatures::default(),
+            OrderFeatures {
+                supports_get_order_info_by_client_order_id: true,
+                ..OrderFeatures::default()
+            },
             OrderTradeOption::default(),
             WebSocketOptions::default(),
             true,
-            true,
+            AllowedEventSourceType::default(),
             AllowedEventSourceType::default(),
             AllowedEventSourceType::default(),
         ),
         Commission::default(),
         true,
     )
-    .await
-    {
-        Ok(binance_builder) => binance_builder,
-        Err(_) => return,
-    };
+    .await;
 
     let first_order_proxy = OrderProxy::new(
         exchange_account_id,
         Some("FromGetOpenOrdersByCurrencyPairTest".to_owned()),
         CancellationToken::default(),
-        binance_builder.default_price,
+        binance_builder.min_price,
         binance_builder.min_amount,
+        binance_builder.default_currency_pair,
     );
 
     first_order_proxy
@@ -146,8 +117,9 @@ async fn get_open_orders_for_each_currency_pair_separately() {
         exchange_account_id,
         Some("FromGetOpenOrdersByCurrencyPairTest".to_owned()),
         CancellationToken::default(),
-        binance_builder.default_price,
+        binance_builder.min_price,
         binance_builder.min_amount,
+        binance_builder.default_currency_pair,
     );
 
     second_order_proxy
@@ -161,7 +133,7 @@ async fn get_open_orders_for_each_currency_pair_separately() {
         .await
         .expect("in test");
 
-    let _ = binance_builder
+    binance_builder
         .exchange
         .cancel_opened_orders(CancellationToken::default(), true)
         .await;

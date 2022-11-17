@@ -6,12 +6,12 @@ use mockall::automock;
 /// NOTE: you need to avoid using mock objects in a parallel way https://docs.rs/mockall/0.10.2/mockall/#static-methods
 ///       some example is here https://stackoverflow.com/questions/51694017/how-can-i-avoid-running-some-tests-in-parallel
 #[cfg_attr(test, automock)]
-pub(crate) mod time_manager {
+pub mod time_manager {
 
     use mmb_utils::DateTime;
 
     /// Return current date in UTC
-    pub(crate) fn now() -> DateTime {
+    pub fn now() -> DateTime {
         chrono::Utc::now()
     }
 }
@@ -38,7 +38,7 @@ pub(crate) mod tests {
         time_manager_mock_object.expect().returning(move || {
             chrono::Utc
                 .ymd(2021, 9, 20)
-                .and_hms(0, 0, seconds_offset.lock().clone())
+                .and_hms(0, 0, *seconds_offset.lock())
         });
 
         (time_manager_mock_object, mock_locker)

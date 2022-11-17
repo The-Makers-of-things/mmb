@@ -1,26 +1,30 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use futures::FutureExt;
 use mmb_utils::cancellation_token::CancellationToken;
+use mmb_utils::infrastructure::{SpawnFutureFlags, WithExpect};
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::mapref::entry::Entry::{Occupied, Vacant};
+use mmb_domain::events::EventSourceType;
+use mmb_domain::market::CurrencyCode;
 use mmb_utils::nothing_to_do;
 use tokio::sync::{broadcast, oneshot};
+use tokio::time::timeout;
 
-use crate::exchanges::common::ToStdExpected;
-use crate::exchanges::common::{CurrencyCode, ExchangeErrorType};
+use crate::exchanges::general::exchange::Exchange;
 use crate::exchanges::general::exchange::RequestResult;
 use crate::exchanges::general::features::RestFillsType;
-use crate::exchanges::general::handlers::handle_order_filled::FillEventData;
+use crate::exchanges::general::handlers::handle_order_filled::{FillAmount, FillEvent};
 use crate::exchanges::general::request_type::RequestType;
-use crate::exchanges::general::symbol::Symbol;
 use crate::exchanges::timeouts::requests_timeout_manager::RequestGroupId;
 use crate::infrastructure::spawn_future_timed;
-use crate::orders::fill::{EventSourceType, OrderFillType};
-use crate::orders::order::{OrderExecutionType, OrderInfo, OrderStatus, OrderType};
-use crate::{exchanges::general::exchange::Exchange, orders::pool::OrderRef};
+use mmb_domain::exchanges::symbol::Symbol;
+use mmb_domain::market::ExchangeErrorType;
+use mmb_domain::order::fill::OrderFillType;
+use mmb_domain::order::pool::OrderRef;
+use mmb_domain::order::snapshot::{OrderExecutionType, OrderInfo, OrderStatus, OrderType};
+use mmb_utils::time::ToStdExpected;
 
 use super::get_order_trades::OrderTrade;
 
@@ -34,14 +38,22 @@ impl Exchange {
         // TODO make MetricsRegistry.Metrics.Measure.Timer.Time(MetricsRegistry.Timers.WaitOrderFinishTimer,
         //     MetricsRegistry.Timers.CreateExchangeTimerTags(order.ExchangeId));
 
+        let client_order_id = order.client_order_id();
+
         if order.status() == OrderStatus::FailedToCreate {
             return Ok(order.clone());
         }
 
-        match self.wait_finish_order.entry(order.client_order_id()) {
+        // Be sure value will be removed anyway
+        let _guard = scopeguard::guard(client_order_id.clone(), |client_order_id| {
+            let _ = self.wait_finish_order.remove(&client_order_id);
+        });
+
+        match self.wait_finish_order.entry(client_order_id) {
             Occupied(entry) => {
-                let tx = entry.get();
-                let mut rx = tx.subscribe();
+                let mut rx = entry.get().subscribe();
+                drop(entry);
+
                 // Just wait until order finishing future completed or operation cancelled
                 tokio::select! {
                     _ = rx.recv() => nothing_to_do(),
@@ -51,11 +63,6 @@ impl Exchange {
                 Ok(order.clone())
             }
             Vacant(vacant_entry) => {
-                // Be sure value will be removed anyway
-                let _guard = scopeguard::guard((), |_| {
-                    let _ = self.wait_finish_order.remove(&order.client_order_id());
-                });
-
                 let (tx, _) = broadcast::channel(1);
                 let _ = vacant_entry.insert(tx.clone());
 
@@ -90,29 +97,21 @@ impl Exchange {
         let linked_cancellation_token = cancellation_token.create_linked_token();
 
         // if has_websocket_notification: in background we poll for fills every x seconds for those rare cases then we missed a websocket fill
-        let cloned_order = order.clone();
-        let cloned_self = self.clone();
-        let cloned_cancellation_token = linked_cancellation_token.clone();
         let _guard = scopeguard::guard((), |_| {
             linked_cancellation_token.cancel();
         });
 
-        let action = async move {
-            cloned_self
-                .poll_order_fills(
-                    &cloned_order,
-                    has_websocket_notification,
-                    pre_reservation_group_id,
-                    cloned_cancellation_token,
-                )
-                .await
-        };
         let three_hours = Duration::from_secs(10800);
         let poll_order_fill_future = spawn_future_timed(
             "poll_order_fills future",
-            false,
+            SpawnFutureFlags::STOP_BY_TOKEN,
             three_hours,
-            action.boxed(),
+            self.clone().poll_order_fills(
+                order.clone(),
+                has_websocket_notification,
+                pre_reservation_group_id,
+                linked_cancellation_token.clone(),
+            ),
         );
 
         if !has_websocket_notification {
@@ -130,8 +129,8 @@ impl Exchange {
     }
 
     pub(crate) async fn poll_order_fills(
-        &self,
-        order: &OrderRef,
+        self: Arc<Self>,
+        ref order: OrderRef,
         is_fallback: bool,
         pre_reservation_group_id: Option<RequestGroupId>,
         cancellation_token: CancellationToken,
@@ -164,12 +163,14 @@ impl Exchange {
                 };
 
                 if delay_till_fallback_request > Duration::ZERO {
-                    let sleep = tokio::time::sleep(delay_till_fallback_request);
-                    tokio::select! {
-                        _ = sleep => nothing_to_do(),
-                        _ = cancellation_token.when_cancelled() => {
-                            return Ok(());
-                        }
+                    match timeout(
+                        delay_till_fallback_request,
+                        cancellation_token.when_cancelled(),
+                    )
+                    .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(_) => nothing_to_do(),
                     }
                 }
             } else {
@@ -177,14 +178,12 @@ impl Exchange {
                     order.fn_ref(|order| order.internal_props.last_order_trades_request_time);
                 let polling_trades_range = 20f64;
 
+                let exchange_account_id = self.exchange_account_id;
                 let counter = *self
                     .polling_trades_counts
-                    .get(&self.exchange_account_id)
+                    .get(&exchange_account_id)
                     .with_context(|| {
-                        format!(
-                            "No counts for exchange_account_id {}",
-                            self.exchange_account_id
-                        )
+                        format!("No counts for exchange_account_id {exchange_account_id}")
                     })? as f64;
 
                 self.polling_timeout_manager
@@ -238,20 +237,16 @@ impl Exchange {
         pre_reservation_group_id: Option<RequestGroupId>,
         cancellation_token: CancellationToken,
     ) -> Result<bool> {
-        let order_execution_type = order.fn_ref(|order| order.header.execution_type);
+        let order_execution_type = order.header().options.execution_type();
         if !self.features.order_features.maker_only
-            || order_execution_type != OrderExecutionType::MakerOnly
+            || order_execution_type != Some(OrderExecutionType::MakerOnly)
         {
             return Ok(false);
         }
 
         let exchange_account_id = self.exchange_account_id;
-        let client_order_id = &order.client_order_id();
-        log::info!(
-            "check_maker_only_order_status for exchange_account_id: {} and client order_id: {}",
-            exchange_account_id,
-            client_order_id
-        );
+        let client_order_id = order.client_order_id();
+        log::info!("check_maker_only_order_status for exchange_account_id: {exchange_account_id} and client order_id: {client_order_id}");
 
         let _ = self
             .timeout_manager
@@ -260,7 +255,7 @@ impl Exchange {
                 RequestType::GetOrderInfo,
                 pre_reservation_group_id,
                 cancellation_token,
-            )?
+            )
             .await;
 
         let order_info_result = self.get_order_info(order).await;
@@ -287,7 +282,7 @@ impl Exchange {
                     &exchange_order_id,
                     None,
                     EventSourceType::RestFallback,
-                )?;
+                );
 
                 Ok(true)
             }
@@ -302,9 +297,10 @@ impl Exchange {
         cancellation_token: CancellationToken,
     ) -> Result<()> {
         let currency_pair = order.currency_pair();
-        let symbol = self.symbols.get(&currency_pair).with_context(|| {
-            format!("No such symbol for given currency_pair {}", currency_pair,)
-        })?;
+        let symbol = self
+            .symbols
+            .get(&currency_pair)
+            .with_expect(|| format!("No symbol {currency_pair} for check_order_fills"));
 
         let rest_fills_type = &self.features.rest_fills_features.fills_type;
         let request_type_to_use = match rest_fills_type {
@@ -387,14 +383,12 @@ impl Exchange {
                 request_type,
                 pre_reservation_group_id,
                 cancellation_token,
-            )?
+            )
             .await;
 
-        log::info!("Checking request_type {:?} in check_order_fills with client_order_id {}, exchange_order_id {:?}, on {}",
-            request_type,
-            order.client_order_id(),
-            order.exchange_order_id(),
-            self.exchange_account_id);
+        let (client_order_id, exchange_order_id) = order.order_ids();
+
+        log::info!("Checking request_type {request_type:?} in check_order_fills with client_order_id {client_order_id}, exchange_order_id {exchange_order_id:?}, on {}", self.exchange_account_id);
 
         match request_type {
             RequestType::GetOrderTrades => {
@@ -402,16 +396,16 @@ impl Exchange {
 
                 if let RequestResult::Success(ref order_trades) = order_trades {
                     for order_trade in order_trades {
-                        if order.get_fills().0.into_iter().any(|order_fill| {
-                            order_fill
-                                .trade_id()
-                                .map(|fill_trade_id| fill_trade_id == &order_trade.trade_id)
-                                .unwrap_or(false)
-                        }) {
+                        let trade_id = Some(&order_trade.trade_id);
+                        let is_fill_exists = order.fn_ref(|o| {
+                            o.fills.fills.iter().any(|fill| fill.trade_id() == trade_id)
+                        });
+
+                        if is_fill_exists {
                             continue;
                         };
 
-                        self.handle_order_filled_for_restfallback(order, order_trade)?;
+                        self.handle_order_filled_for_rest_fallback(order, order_trade);
                     }
                 }
 
@@ -432,26 +426,24 @@ impl Exchange {
                             .clone()
                             .map(|currency_code| CurrencyCode::new(&currency_code));
 
-                        let event_data = FillEventData {
+                        let mut fill_event = FillEvent {
                             source_type: EventSourceType::RestFallback,
                             trade_id: None,
                             client_order_id: Some(order.client_order_id()),
                             exchange_order_id,
                             fill_price: order_info.average_fill_price,
-                            fill_amount: order_info.filled_amount,
-                            is_diff: false,
-                            total_filled_amount: None,
+                            fill_amount: FillAmount::Total {
+                                total_filled_amount: order_info.filled_amount,
+                            },
                             order_role: None,
                             commission_currency_code,
                             commission_rate: order_info.commission_rate,
                             commission_amount: order_info.commission_amount,
                             fill_type: OrderFillType::UserTrade,
-                            trade_currency_pair: None,
-                            order_side: None,
-                            order_amount: None,
+                            special_order_data: None,
                             fill_date: None,
                         };
-                        self.handle_order_filled(event_data)?;
+                        self.handle_order_filled(&mut fill_event);
 
                         RequestResult::Success(order_info)
                     }
@@ -463,42 +455,39 @@ impl Exchange {
                     RequestResult::Error(error) => Ok(RequestResult::Error(error)),
                 }
             }
-            _ => bail!(
-                "Unsupported request type {:?} in check_order_fills",
-                request_type
-            ),
+            _ => bail!("Unsupported request type {request_type:?} in check_order_fills"),
         }
     }
 
-    pub(crate) fn handle_order_filled_for_restfallback(
+    pub(crate) fn handle_order_filled_for_rest_fallback(
         &self,
         order: &OrderRef,
         order_trade: &OrderTrade,
-    ) -> Result<()> {
-        let exchange_order_id = order.exchange_order_id().ok_or(anyhow!(
-            "No exchange_order_id in order while handle_order_filled_for_restfallback"
-        ))?;
-        let event_data = FillEventData {
+    ) {
+        let exchange_order_id = order
+            .exchange_order_id()
+            .expect("No exchange_order_id in order while handle_order_filled_for_rest_fallback");
+
+        let mut fill_event = FillEvent {
             source_type: EventSourceType::RestFallback,
             trade_id: Some(order_trade.trade_id.clone()),
             client_order_id: Some(order.client_order_id()),
             exchange_order_id,
             fill_price: order_trade.price,
-            fill_amount: order_trade.amount,
-            is_diff: true,
-            total_filled_amount: None,
+            fill_amount: FillAmount::Incremental {
+                fill_amount: order_trade.amount,
+                total_filled_amount: None,
+            },
             order_role: Some(order_trade.order_role),
             commission_currency_code: Some(order_trade.fee_currency_code),
             commission_rate: order_trade.fee_rate,
             commission_amount: order_trade.fee_amount,
             fill_type: OrderFillType::UserTrade,
-            trade_currency_pair: None,
-            order_side: None,
-            order_amount: None,
+            special_order_data: None,
             fill_date: Some(order_trade.datetime),
         };
 
-        self.handle_order_filled(event_data)
+        self.handle_order_filled(&mut fill_event)
     }
 
     pub(super) async fn create_order_finish_future(
@@ -506,12 +495,12 @@ impl Exchange {
         order: &OrderRef,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        if order.is_finished() {
+        let client_order_id = order.client_order_id();
+        let (status, exchange_order_id) = order.fn_ref(|x| (x.status(), x.exchange_order_id()));
+
+        if status.is_finished() {
             log::info!(
-                "Instantly exiting create_order_finish_future() because status is {:?} {} {:?} {}",
-                order.status(),
-                order.client_order_id(),
-                order.exchange_order_id(),
+                "Instantly exiting create_order_finish_future() because status is {status:?} {client_order_id} {exchange_order_id:?} {}",
                 self.exchange_account_id
             );
 
@@ -522,17 +511,13 @@ impl Exchange {
 
         let (tx, rx) = oneshot::channel();
         self.orders_finish_events
-            .entry(order.client_order_id())
+            .entry(client_order_id.clone())
             .or_insert(tx);
 
-        if order.is_finished() {
-            log::trace!(
-                "Exiting create_order_finish_task because order's status turned {:?} {} {:?} {}",
-                order.status(),
-                order.client_order_id(),
-                order.exchange_order_id(),
-                self.exchange_account_id
-            );
+        let (status, exchange_order_id) = order.fn_ref(|x| (x.status(), x.exchange_order_id()));
+
+        if status.is_finished() {
+            log::trace!("Exiting create_order_finish_task because order's status turned {status:?} {client_order_id} {exchange_order_id:?} {}", self.exchange_account_id);
 
             self.order_finished_notify(order);
 
@@ -559,6 +544,7 @@ fn is_finished(
     order: &OrderRef,
     exit_on_order_is_finished_even_if_fills_didnt_received: bool,
 ) -> bool {
-    order.status() == OrderStatus::Completed
-        || order.is_finished() && exit_on_order_is_finished_even_if_fills_didnt_received
+    let status = order.status();
+    status == OrderStatus::Completed
+        || status.is_finished() && exit_on_order_is_finished_even_if_fills_didnt_received
 }

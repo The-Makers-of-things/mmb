@@ -8,10 +8,10 @@ use mockall::automock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::exchanges::common::CurrencyPair;
-use crate::exchanges::common::ExchangeAccountId;
 use crate::exchanges::general::exchange::Exchange;
-use crate::exchanges::general::symbol::Symbol;
+use mmb_domain::exchanges::symbol::Symbol;
+use mmb_domain::market::CurrencyPair;
+use mmb_domain::market::ExchangeAccountId;
 
 #[derive(Clone)]
 pub struct CurrencyPairToSymbolConverter {
@@ -43,6 +43,7 @@ impl CurrencyPairToSymbolConverter {
             .expect("failed to get currency pair")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn exchanges_by_id(&self) -> &HashMap<ExchangeAccountId, Arc<Exchange>> {
         &self.exchanges_by_id
     }

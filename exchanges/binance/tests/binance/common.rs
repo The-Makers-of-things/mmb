@@ -1,30 +1,33 @@
-use std::sync::Arc;
-
 use anyhow::Result;
-use binance::binance::BinanceBuilder;
+use binance::binance::{BinanceBuilder, ErrorHandlerBinance, RestHeadersBinance};
+use function_name::named;
+use hyper::Uri;
 use jsonrpc_core::Value;
-use mmb_core::exchanges::common::{Amount, Price};
-use mmb_core::exchanges::traits::ExchangeClientBuilder;
-use mmb_utils::hashmap;
-use mmb_utils::infrastructure::WithExpect;
-
 use mmb_core::exchanges::hosts::Hosts;
+use mmb_core::exchanges::rest_client::{ErrorHandlerData, UriBuilder};
+use mmb_core::settings::ExchangeSettings;
 use mmb_core::{
-    exchanges::common::ExchangeId,
+    exchanges::rest_client::RestClient,
     exchanges::{
-        common::ExchangeAccountId,
         timeouts::requests_timeout_manager_factory::RequestsTimeoutManagerFactory,
         timeouts::timeout_manager::TimeoutManager,
     },
-    exchanges::{
-        common::SpecificCurrencyPair,
-        rest_client::{self, RestClient},
-    },
     lifecycle::launcher::EngineBuildConfig,
 };
+use mmb_domain::exchanges::symbol::{Precision, Round, Symbol};
+use mmb_domain::market::{CurrencyPair, ExchangeAccountId, SpecificCurrencyPair};
+use mmb_domain::order::snapshot::{Amount, OrderSide, Price};
+use mmb_utils::hashmap;
+use mmb_utils::infrastructure::WithExpect;
 use mmb_utils::value_to_decimal::GetOrErr;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+pub(crate) fn default_currency_pair() -> CurrencyPair {
+    CurrencyPair::from_codes("btc".into(), "usdt".into())
+}
 
 pub(crate) fn get_binance_credentials() -> Result<(String, String)> {
     let api_key = std::env::var("BINANCE_API_KEY");
@@ -54,10 +57,9 @@ pub(crate) fn get_binance_credentials() -> Result<(String, String)> {
 #[macro_export]
 macro_rules! get_binance_credentials_or_exit {
     () => {{
-        match crate::binance::common::get_binance_credentials() {
+        match $crate::binance::common::get_binance_credentials() {
             Ok((api_key, secret_key)) => (api_key, secret_key),
-            Err(error) => {
-                dbg!("{:?}", error);
+            Err(_) => {
                 return;
             }
         }
@@ -65,11 +67,11 @@ macro_rules! get_binance_credentials_or_exit {
 }
 
 pub(crate) fn get_timeout_manager(exchange_account_id: ExchangeAccountId) -> Arc<TimeoutManager> {
-    let engine_build_config =
-        EngineBuildConfig::standard(Box::new(BinanceBuilder) as Box<dyn ExchangeClientBuilder>);
+    let engine_build_config = EngineBuildConfig::new(vec![Box::new(BinanceBuilder)]);
     let timeout_arguments = engine_build_config.supported_exchange_clients
-        [&ExchangeId::new("Binance".into())]
+        [&exchange_account_id.exchange_id]
         .get_timeout_arguments();
+
     let request_timeout_manager = RequestsTimeoutManagerFactory::from_requests_per_period(
         timeout_arguments,
         exchange_account_id,
@@ -78,74 +80,104 @@ pub(crate) fn get_timeout_manager(exchange_account_id: ExchangeAccountId) -> Arc
     TimeoutManager::new(hashmap![exchange_account_id => request_timeout_manager])
 }
 
+#[named]
 async fn send_request(
-    hosts: &Hosts,
-    api_key: &String,
-    url_path: &str,
-    http_params: &Vec<(String, String)>,
+    uri: Uri,
+    api_key: &str,
+    exchange_account_id: ExchangeAccountId,
+    is_usd_m_futures: bool,
 ) -> String {
-    let rest_client = RestClient::new();
-
-    let full_url = rest_client::build_uri(&hosts.rest_host, url_path, http_params)
-        .expect("build_uri is failed");
+    let rest_client = RestClient::new(
+        ErrorHandlerData::new(false, exchange_account_id, ErrorHandlerBinance::default()),
+        RestHeadersBinance {
+            api_key: api_key.to_owned(),
+            is_usd_m_futures,
+        },
+    );
 
     rest_client
-        .get(full_url, api_key)
+        .get(uri.clone(), function_name!(), "".to_string())
         .await
-        .with_expect(|| format!("failed to request {}", url_path))
+        .with_expect(|| format!("failed to request {uri}"))
         .content
 }
 
-/// Automatic price calculation for orders. This function gets the price from the middle of order book bids side.
-/// This helps to avoid creating orders in the top of the order book.
-pub(crate) async fn get_default_price(
+/// Automatic price calculation for orders. This function gets the price from 10-th price level of
+/// order book if it exists otherwise last bid price from order book.
+/// This helps to avoid creating order in the top of the order book and filling it.
+/// Returns tuple of execution_price (order with such price supposed to be executed immediately)
+/// and min_price (for orders which must be opened after creation for a some time)
+pub(crate) async fn get_prices(
     currency_pair: SpecificCurrencyPair,
     hosts: &Hosts,
-    api_key: &String,
-) -> Price {
+    settings: &ExchangeSettings,
+    price_precision: &Precision,
+) -> (Price, Price) {
     #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
     struct OrderBook {
         pub bids: Vec<(Decimal, Decimal)>,
     }
 
+    let mut builder = UriBuilder::from_path(match settings.is_margin_trading {
+        true => "/fapi/v1/depth",
+        false => "/api/v3/depth",
+    });
+    builder.add_kv("symbol", currency_pair);
+    let uri = builder.build_uri(hosts.rest_uri_host(), true);
+
     let data = send_request(
-        hosts,
-        api_key,
-        "/api/v3/depth",
-        &vec![("symbol".to_owned(), currency_pair.as_str().to_owned())],
+        uri,
+        &settings.api_key,
+        settings.exchange_account_id,
+        settings.is_margin_trading,
     )
     .await;
 
-    let value: OrderBook = serde_json::from_str(data.as_str())
-        .with_expect(|| format!("failed to deserialize data: {}", data));
+    let value: OrderBook =
+        serde_json::from_str(&data).with_expect(|| format!("failed to deserialize data: {data}"));
 
-    // getting price for order from the middle of the order book
-    // use bids because this price is little lower then asks
-    value
+    let top_bid_price = value
         .bids
-        .get(value.bids.len() / 2)
-        .expect("failed to get bid from the middle of the order book")
-        .clone()
-        .0
+        .first()
+        .expect("Can't get bid value from order book")
+        .0;
+    let low_bid_price = value
+        .bids
+        .last()
+        .expect("Can't get bid value from order book")
+        .0;
+
+    (
+        top_bid_price + price_precision.get_tick() * dec!(2),
+        low_bid_price,
+    )
 }
 
 /// Automatic amount calculation for orders. This function calculate the amount for price and MIN_NOTIONAL filter.
 pub(crate) async fn get_min_amount(
     currency_pair: SpecificCurrencyPair,
     hosts: &Hosts,
-    api_key: &String,
+    settings: &ExchangeSettings,
     price: Price,
+    symbol: &Symbol,
 ) -> Amount {
+    let mut builder = UriBuilder::from_path(match settings.is_margin_trading {
+        true => "/fapi/v1/exchangeInfo",
+        false => "/api/v3/exchangeInfo",
+    });
+    builder.add_kv("symbol", currency_pair);
+    let uri = builder.build_uri(hosts.rest_uri_host(), true);
+
     let data = send_request(
-        hosts,
-        api_key,
-        "/api/v3/exchangeInfo",
-        &vec![("symbol".to_owned(), currency_pair.as_str().to_owned())],
+        uri,
+        &settings.api_key,
+        settings.exchange_account_id,
+        settings.is_margin_trading,
     )
     .await;
 
-    let value: Value = serde_json::from_str(data.as_str())
-        .with_expect(|| format!("failed to deserialize data: {}", data));
+    let value: Value =
+        serde_json::from_str(&data).with_expect(|| format!("failed to deserialize data: {data}"));
 
     let filters = value
         .pointer("/symbols/0/filters")
@@ -164,8 +196,18 @@ pub(crate) async fn get_min_amount(
         .expect("Failed to get min_notional_filter");
 
     let min_notional = min_notional_filter
-        .get_as_decimal("minNotional")
+        .get_as_decimal(match settings.is_margin_trading {
+            true => "notional",
+            false => "minNotional",
+        })
         .expect("Failed to get min_notional");
 
-    (min_notional / price).ceil()
+    symbol.amount_round(min_notional / price, Round::Ceiling)
+}
+
+pub(crate) fn get_position_value_by_side(side: OrderSide, position: Amount) -> Amount {
+    match side {
+        OrderSide::Buy => position,
+        OrderSide::Sell => -position,
+    }
 }

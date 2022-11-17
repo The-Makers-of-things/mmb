@@ -1,15 +1,14 @@
-use crate::exchanges::common::{Amount, CurrencyCode, ExchangeError, Price};
-use crate::exchanges::events::TradeId;
 use crate::exchanges::general::exchange::RequestResult;
-use crate::exchanges::general::symbol::Symbol;
-use crate::orders::fill::OrderFillType;
-use crate::orders::order::{ExchangeOrderId, OrderRole};
-use crate::{
-    exchanges::general::{exchange::Exchange, features::RestFillsType},
-    orders::pool::OrderRef,
-};
+use crate::exchanges::general::{exchange::Exchange, features::RestFillsType};
 use anyhow::{bail, Context, Result};
 use itertools::Itertools;
+use mmb_domain::events::TradeId;
+use mmb_domain::exchanges::symbol::Symbol;
+use mmb_domain::market::CurrencyCode;
+use mmb_domain::order::fill::OrderFillType;
+use mmb_domain::order::pool::OrderRef;
+use mmb_domain::order::snapshot::{Amount, Price};
+use mmb_domain::order::snapshot::{ExchangeOrderId, OrderRole};
 use mmb_utils::DateTime;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +27,7 @@ pub struct OrderTrade {
 }
 
 impl OrderTrade {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         exchange_order_id: ExchangeOrderId,
         trade_id: TradeId,
@@ -73,49 +73,21 @@ impl Exchange {
         symbol: &Symbol,
         order: &OrderRef,
     ) -> Result<RequestResult<Vec<OrderTrade>>> {
-        let my_trades = self.get_my_trades(symbol, None).await?;
+        let my_trades = self.exchange_client.get_my_trades(symbol, None).await;
         match my_trades {
             RequestResult::Error(_) => Ok(my_trades),
             RequestResult::Success(my_trades) => {
                 let exchange_order_id = order
                     .exchange_order_id()
-                    .with_context(|| format!("There is no exchange_order in order {:?}", order))?;
+                    .with_context(|| format!("There is no exchange_order in order {order:?}"))?;
 
-                let data = my_trades
+                let trades = my_trades
                     .into_iter()
                     .filter(|order_trade| order_trade.exchange_order_id == exchange_order_id)
                     .collect_vec();
 
-                Ok(RequestResult::Success(data))
+                Ok(RequestResult::Success(trades))
             }
-        }
-    }
-
-    pub async fn get_my_trades(
-        &self,
-        symbol: &Symbol,
-        last_date_time: Option<DateTime>,
-    ) -> Result<RequestResult<Vec<OrderTrade>>> {
-        // TODO Add metric UseTimeMetric(RequestType::GetMyTrades)
-        let response = self
-            .exchange_client
-            .request_my_trades(symbol, last_date_time)
-            .await?;
-
-        match self.get_rest_error(&response) {
-            Some(error) => Ok(RequestResult::Error(error)),
-            None => match self
-                .exchange_client
-                .parse_get_my_trades(&response, last_date_time)
-            {
-                Ok(data) => Ok(RequestResult::Success(data)),
-                Err(error) => {
-                    self.handle_parse_error(error, &response, "".into(), None)?;
-                    Ok(RequestResult::Error(ExchangeError::unknown_error(
-                        &response.content,
-                    )))
-                }
-            },
         }
     }
 }

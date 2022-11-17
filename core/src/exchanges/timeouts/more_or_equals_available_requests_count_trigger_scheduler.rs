@@ -1,28 +1,21 @@
 use std::sync::Arc;
 
-use crate::exchanges::common::ToStdExpected;
-use crate::infrastructure::spawn_future;
+use crate::infrastructure::spawn_future_ok;
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use futures::FutureExt;
-use mmb_utils::DateTime;
+use mmb_utils::time::ToStdExpected;
+use mmb_utils::{infrastructure::SpawnFutureFlags, DateTime};
 use parking_lot::Mutex;
 use tokio::time::sleep;
 
 pub type TriggerHandler = Mutex<Box<dyn FnMut() -> Result<()> + Send>>;
 
+#[derive(Default)]
 pub struct MoreOrEqualsAvailableRequestsCountTriggerScheduler {
     increasing_count_triggers: Mutex<Vec<Arc<MoreOrEqualsAvailableRequestsCountTrigger>>>,
 }
 
 impl MoreOrEqualsAvailableRequestsCountTriggerScheduler {
-    pub fn new() -> Self {
-        let triggers = Mutex::new(Vec::new());
-        Self {
-            increasing_count_triggers: triggers,
-        }
-    }
-
     pub fn utc_now() -> DateTime {
         Utc::now()
     }
@@ -79,21 +72,21 @@ impl MoreOrEqualsAvailableRequestsCountTrigger {
             return;
         }
 
-        // Note: suppose that requests restriction same as in RequestsTimeoutManager (requests count in specified time period)
+        // NOTE: suppose that requests restriction same as in RequestsTimeoutManager (requests count in specified time period)
         // It logical dependency to RequestsTimeoutManager how calculate trigger time
         // var triggerTime = isGreater ? lastRequestTime : lastRequestTime + periodDuration;
         let trigger_time = last_request_time + period_duration;
         let mut delay = trigger_time - current_time;
         delay = delay.max(Duration::zero());
 
-        let action = async move {
-            self.clone().handle_inner(delay).await;
-            Ok(())
-        };
-        spawn_future("handle_inner for schedule_handler()", true, action.boxed());
+        spawn_future_ok(
+            "handle_inner for schedule_handler()",
+            SpawnFutureFlags::STOP_BY_TOKEN | SpawnFutureFlags::DENY_CANCELLATION,
+            self.handle_inner(delay),
+        );
     }
 
-    async fn handle_inner(&self, delay: Duration) {
+    async fn handle_inner(self: Arc<Self>, delay: Duration) {
         let delay_std = delay.to_std_expected();
 
         sleep(delay_std).await;

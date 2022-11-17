@@ -3,8 +3,21 @@ members = [
     "control_panel",
     "core",
     "core_tests",
-    "example",
+    "domain",
+    "examples/binance_demo",
+    "examples/binance_demo_new",
+    "examples/bitmex_demo",
+    "examples/strategies",
     "exchanges/binance",
+    "exchanges/bitmex",
+    "exchanges/interactive_brokers",
+    "mmb_database",
     "mmb_rpc",
-    "mmb_utils"
+    "mmb_utils",
+    "visualization/api",
+    "urlencoding_macro"
+]
+exclude = [
+    "examples/serum_demo",
+    "exchanges/serum",
 ]

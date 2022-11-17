@@ -6,7 +6,7 @@ use std::{
 use chrono::{Duration, Utc};
 use mmb_utils::DateTime;
 
-use crate::exchanges::common::ExchangeAccountId;
+use mmb_domain::market::ExchangeAccountId;
 
 use super::{
     more_or_equals_available_requests_count_trigger_scheduler::MoreOrEqualsAvailableRequestsCountTriggerScheduler,
@@ -24,7 +24,7 @@ impl RequestsTimeoutManagerFactory {
         timeout_arguments: RequestTimeoutArguments,
         exchange_account_id: ExchangeAccountId,
     ) -> Arc<RequestsTimeoutManager> {
-        let trigger_scheduler = MoreOrEqualsAvailableRequestsCountTriggerScheduler::new();
+        let trigger_scheduler = MoreOrEqualsAvailableRequestsCountTriggerScheduler::default();
         RequestsTimeoutManager::new(
             timeout_arguments.requests_per_period,
             timeout_arguments.period,

@@ -7,3 +7,6 @@ target
 /.idea/
 *credentials*
 .DS_Store
+.idea
+*.log
+*.iml

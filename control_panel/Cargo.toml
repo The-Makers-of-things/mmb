@@ -6,9 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-actix-files = "0.6.0-beta.7"
-actix-server = "=2.0.0-beta.9"
-actix-web = { version = "4.0.0-beta.10" }
+actix-files = "0.6"
+actix-server = "=2.1"
+actix-web = "4.1"
 anyhow = "1"
 futures = "0.3"
 jsonrpc-core = "18.0.0"
@@ -17,8 +17,8 @@ jsonrpc-derive = "18.0.0"
 log = "0.4"
 mmb_rpc = { path = "../mmb_rpc" }
 mmb_utils = { path = "../mmb_utils" }
-parking_lot = { version = "0.11", features = ["serde"]}
-tokio = { version = "1", features = ["macros", "time", "sync", "rt", "signal"]}
+parking_lot = { version = "0.12", features = ["serde"]}
+tokio = { version = "1", features = ["macros", "time", "sync", "signal", "parking_lot"]}
 
 
 [[bin]]

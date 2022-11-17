@@ -2,22 +2,23 @@ use futures::future::ready;
 use futures::future::Either;
 use futures::FutureExt;
 use mmb_utils::cancellation_token::CancellationToken;
-use mmb_utils::infrastructure::{CompletionReason, FutureOutcome};
+use mmb_utils::infrastructure::{CompletionReason, FutureOutcome, WithExpect};
 use mmb_utils::DateTime;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use anyhow::Result;
 use chrono::Utc;
 
-use crate::exchanges::common::ExchangeAccountId;
 use crate::exchanges::general::request_type::RequestType;
 use crate::exchanges::timeouts::requests_timeout_manager::{
     RequestGroupId, RequestsTimeoutManager,
 };
+use mmb_domain::market::ExchangeAccountId;
 
 pub type BoxFuture = Box<dyn Future<Output = Result<()>> + Sync + Send>;
 
@@ -39,7 +40,7 @@ impl TimeoutManager {
         exchange_account_id: ExchangeAccountId,
         requests_count: usize,
         group_type: String,
-    ) -> Result<Option<RequestGroupId>> {
+    ) -> Option<RequestGroupId> {
         self.inner[&exchange_account_id].try_reserve_group(group_type, now(), requests_count)
     }
 
@@ -47,7 +48,7 @@ impl TimeoutManager {
         &self,
         exchange_account_id: ExchangeAccountId,
         group_id: RequestGroupId,
-    ) -> Result<bool> {
+    ) -> bool {
         self.inner[&exchange_account_id].remove_group(group_id, now())
     }
 
@@ -55,7 +56,7 @@ impl TimeoutManager {
         &self,
         exchange_account_id: ExchangeAccountId,
         request_type: RequestType,
-    ) -> Result<bool> {
+    ) -> bool {
         self.inner[&exchange_account_id].try_reserve_instant(request_type, now(), None)
     }
 
@@ -64,7 +65,7 @@ impl TimeoutManager {
         exchange_account_id: ExchangeAccountId,
         request_type: RequestType,
         pre_reserved_group_id: Option<RequestGroupId>,
-    ) -> Result<bool> {
+    ) -> bool {
         self.inner[&exchange_account_id].try_reserve_instant(
             request_type,
             now(),
@@ -78,15 +79,15 @@ impl TimeoutManager {
         request_type: RequestType,
         pre_reservation_group_id: Option<RequestGroupId>,
         cancellation_token: CancellationToken,
-    ) -> Result<impl Future<Output = FutureOutcome> + Send + Sync> {
-        let inner = (&self.inner[&exchange_account_id]).clone();
+    ) -> impl Future<Output = FutureOutcome> + Send + Sync {
+        let inner = self.inner[&exchange_account_id].clone();
 
         let convert = |handle: JoinHandle<FutureOutcome>| {
             handle.map(|res| match res {
                 Ok(future_outcome) => future_outcome,
                 // Only panic can happen here and only in case if spawn_future() panicked itself
-                Err(error) => {
-                    log::error!("Future in reserve_when_available got error: {}", error);
+                Err(err) => {
+                    log::error!("Future in reserve_when_available got error: {err}");
                     FutureOutcome::new(
                         "spawn_future() for reserve_when_available".to_owned(),
                         Uuid::new_v4(),
@@ -98,20 +99,27 @@ impl TimeoutManager {
 
         let now = now();
         if pre_reservation_group_id.is_none() {
-            let result = inner.reserve_when_available(request_type, now, cancellation_token)?;
-            return Ok(Either::Left(convert(result.0)));
+            let result = inner.reserve_when_available(request_type, now, cancellation_token);
+            return Either::Left(convert(result.0));
         }
 
-        if inner.try_reserve_instant(request_type, now, pre_reservation_group_id)? {
-            return Ok(Either::Right(ready(FutureOutcome::new(
+        if inner.try_reserve_instant(request_type, now, pre_reservation_group_id) {
+            return Either::Right(ready(FutureOutcome::new(
                 "spawn_future() for try_reserve_instant".to_owned(),
                 Uuid::new_v4(),
                 CompletionReason::CompletedSuccessfully,
-            ))));
+            )));
         }
 
-        let result = inner.reserve_when_available(request_type, now, cancellation_token)?;
-        Ok(Either::Left(convert(result.0)))
+        let result = inner.reserve_when_available(request_type, now, cancellation_token);
+        Either::Left(convert(result.0))
+    }
+
+    pub fn get_period_duration(&self, exchange_account_id: ExchangeAccountId) -> Duration {
+        self.inner
+            .get(&exchange_account_id)
+            .with_expect(|| format!("Can't find timeout manger for {exchange_account_id}"))
+            .get_period_duration()
     }
 }
 

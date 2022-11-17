@@ -1,7 +1,9 @@
-use crate::exchanges::common::{Amount, CurrencyCode, CurrencyPair, ExchangeAccountId};
+use mmb_domain::market::{CurrencyCode, CurrencyPair, ExchangeAccountId};
+use mmb_domain::order::snapshot::Amount;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-pub trait BaseStrategySettings {
+pub trait DispositionStrategySettings {
     fn exchange_account_id(&self) -> ExchangeAccountId;
     fn currency_pair(&self) -> CurrencyPair;
     fn max_amount(&self) -> Amount;
@@ -10,32 +12,41 @@ pub trait BaseStrategySettings {
 /// Application settings
 /// Attention! After changing in runtime, you need to save the settings. See issue #146
 /// For the settings to be applied, the trading engine must be restarted after changing the config
-#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
-pub struct AppSettings<StrategySettings>
-where
-    StrategySettings: BaseStrategySettings + Clone,
-{
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AppSettings<StrategySettings: Clone> {
     pub strategy: StrategySettings,
     pub core: CoreSettings,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CoreSettings {
+    pub database: Option<DbSettings>,
     pub exchanges: Vec<ExchangeSettings>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct CurrencyPairSetting {
-    pub base: CurrencyCode,
-    pub quote: CurrencyCode,
-    // currency code specific for exchange
-    pub currency_pair: Option<String>,
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DbSettings {
+    pub url: String,
+    pub migrations: Vec<PathBuf>,
+    /// Path to directory for creating temporary directory for save events that was not saved to
+    /// database by any reason and will be resaved to db late
+    pub postponed_events_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CurrencyPairSetting {
+    Ordinary {
+        base: CurrencyCode,
+        quote: CurrencyCode,
+    },
+    Specific(String),
 }
 
 // Field order are matter for serialization:
-// Simple values must be emmited before struct with custom serialization
+// Simple values must be emitted before struct with custom serialization
 // https://github.com/alexcrichton/toml-rs/issues/142#issuecomment-278970591
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ExchangeSettings {
     // TODO add other settings
     pub exchange_account_id: ExchangeAccountId,
@@ -74,7 +85,7 @@ impl ExchangeSettings {
 impl Default for ExchangeSettings {
     fn default() -> Self {
         ExchangeSettings {
-            exchange_account_id: ExchangeAccountId::new("".into(), 0),
+            exchange_account_id: ExchangeAccountId::new("", 0),
             api_key: "".to_string(),
             secret_key: "".to_string(),
             is_margin_trading: false,

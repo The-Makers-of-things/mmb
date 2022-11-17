@@ -1,9 +1,10 @@
 use chrono::{Duration, Utc};
 use mmb_utils::cancellation_token::CancellationToken;
 use mmb_utils::DateTime;
+use tokio::time::timeout;
 
-use crate::exchanges::common::ToStdExpected;
 use crate::exchanges::timeouts::requests_timeout_manager_factory::RequestTimeoutArguments;
+use mmb_utils::time::ToStdExpected;
 
 pub(crate) struct PollingTimeoutManager {
     timeout_arguments: RequestTimeoutArguments,
@@ -35,11 +36,16 @@ impl PollingTimeoutManager {
         let delay_till_fallback_request = interval - time_since_last_request;
 
         if delay_till_fallback_request.num_milliseconds() > 0 {
-            let sleep = tokio::time::sleep(delay_till_fallback_request.to_std_expected());
-            tokio::select! {
-                _ = sleep => {}
-                _ = cancellation_token.when_cancelled() => {}
-            }
+            #[allow(clippy::single_match)]
+            match timeout(
+                delay_till_fallback_request.to_std_expected(),
+                cancellation_token.when_cancelled(),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(_) => {}
+            };
         }
     }
 }

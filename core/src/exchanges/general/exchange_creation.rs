@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use super::commission::Commission;
-use crate::exchanges::events::ExchangeEvent;
-use crate::lifecycle::application_manager::ApplicationManager;
+use crate::database::events::recorder::EventRecorder;
+use crate::exchanges::exchange_blocker::ExchangeBlocker;
+use crate::lifecycle::app_lifetime_manager::AppLifetimeManager;
 use crate::lifecycle::launcher::EngineBuildConfig;
 use crate::settings::ExchangeSettings;
 use crate::{
@@ -13,6 +13,9 @@ use crate::{
     },
     settings::CoreSettings,
 };
+use mmb_domain::events::ExchangeEvent;
+use mmb_domain::exchanges::commission::Commission;
+use mmb_domain::order::pool::OrdersPool;
 use tokio::sync::broadcast;
 
 pub fn create_timeout_manager(
@@ -44,32 +47,40 @@ pub async fn create_exchange(
     user_settings: &ExchangeSettings,
     build_settings: &EngineBuildConfig,
     events_channel: broadcast::Sender<ExchangeEvent>,
-    application_manager: Arc<ApplicationManager>,
+    lifetime_manager: Arc<AppLifetimeManager>,
     timeout_manager: Arc<TimeoutManager>,
+    exchange_blocker: Weak<ExchangeBlocker>,
+    event_recorder: Arc<EventRecorder>,
 ) -> Arc<Exchange> {
+    let exchange_account_id = user_settings.exchange_account_id;
     let exchange_client_builder =
-        &build_settings.supported_exchange_clients[&user_settings.exchange_account_id.exchange_id];
+        &build_settings.supported_exchange_clients[&exchange_account_id.exchange_id];
+    let orders = OrdersPool::new();
 
     let exchange_client = exchange_client_builder.create_exchange_client(
         user_settings.clone(),
         events_channel.clone(),
-        application_manager.clone(),
+        lifetime_manager.clone(),
+        timeout_manager.clone(),
+        orders.clone(),
     );
 
     let exchange = Exchange::new(
-        user_settings.exchange_account_id,
+        exchange_account_id,
         exchange_client.client,
+        orders,
         exchange_client.features,
         exchange_client_builder.get_timeout_arguments(),
         events_channel,
-        application_manager,
+        lifetime_manager,
         timeout_manager,
+        exchange_blocker,
         Commission::default(),
+        event_recorder,
     );
 
     exchange.build_symbols(&user_settings.currency_pairs).await;
-
-    exchange.clone().connect().await;
+    exchange.exchange_client.initialized(exchange.clone()).await;
 
     exchange
 }
